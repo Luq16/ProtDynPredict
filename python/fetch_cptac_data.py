@@ -28,24 +28,49 @@ sys.modules['pyranges'] = pyranges_mock
 import cptac
 
 # --- Configuration ---
+cancer_type = sys.argv[1] if len(sys.argv) > 1 else "ucec"
+cancer_type = cancer_type.lower()
+
+CANCER_MAP = {
+    "ucec": ("Ucec", "Endometrial"),
+    "coad": ("Coad", "Colorectal"),
+    "brca": ("Brca", "Breast"),
+    "luad": ("Luad", "Lung Adenocarcinoma"),
+    "hnscc": ("Hnscc", "Head and Neck"),
+    "ov": ("Ov", "Ovarian"),
+}
+
+if cancer_type not in CANCER_MAP:
+    print(f"Error: unsupported cancer type '{cancer_type}'")
+    print(f"  Supported: {', '.join(CANCER_MAP.keys())}")
+    sys.exit(1)
+
+cptac_class_name, cancer_label = CANCER_MAP[cancer_type]
+
 MAX_PROTEINS = 3500   # Subset for fast iteration (set to None for all)
 
 print("=" * 60)
 print("  FETCHING CPTAC PROTEOMICS DATA")
 print("=" * 60)
-print(f"  Cancer type: UCEC (Endometrial)")
+print(f"  Cancer type: {cancer_type.upper()} ({cancer_label})")
 print(f"  Comparison: Tumor vs Normal adjacent tissue")
 print(f"  Max proteins: {MAX_PROTEINS or 'all'}")
 print()
 
 # --- Download dataset ---
-print("Downloading CPTAC data (first run downloads ~100-200 MB)...")
-dataset = cptac.Ucec()
+print(f"Downloading CPTAC {cancer_type.upper()} data (first run downloads ~100-200 MB)...")
+dataset = getattr(cptac, cptac_class_name)()
 print("  Dataset loaded.")
 
 # --- Extract proteomics ---
 print("Extracting proteomics quantification...")
-prot_raw = dataset.get_proteomics(source='umich')
+try:
+    prot_raw = dataset.get_proteomics(source='umich')
+except Exception:
+    try:
+        prot_raw = dataset.get_proteomics(source='harmonized')
+    except Exception:
+        prot_raw = dataset.get_proteomics()
 
 # Use gene symbols as column names (Database_IDs are Ensembl, not UniProt)
 if isinstance(prot_raw.columns, pd.MultiIndex):
@@ -197,7 +222,7 @@ if MAX_PROTEINS and len(results_df) > MAX_PROTEINS:
           f"{n_unch} unchanged, {max(0, n_ambig)} ambiguous = {len(results_df)} total")
 
 # --- Summary ---
-print(f"\nDE Summary (CPTAC UCEC, Tumor vs Normal):")
+print(f"\nDE Summary (CPTAC {cancer_type.upper()}, Tumor vs Normal):")
 print(f"  Total proteins:    {len(results_df)}")
 print(f"  Upregulated:       {((results_df['log2FC'] > 0.5) & (results_df['adj_pvalue'] < 0.05)).sum()} (log2FC > 0.5, adj_p < 0.05)")
 print(f"  Downregulated:     {((results_df['log2FC'] < -0.5) & (results_df['adj_pvalue'] < 0.05)).sum()} (log2FC < -0.5, adj_p < 0.05)")
@@ -205,9 +230,11 @@ print(f"  Unchanged:         {((results_df['log2FC'].abs() < 0.25) & (results_df
 print(f"  log2FC range:      [{results_df['log2FC'].min():.2f}, {results_df['log2FC'].max():.2f}]")
 
 # --- Save ---
-Path("data/raw").mkdir(parents=True, exist_ok=True)
-results_df.to_csv("data/raw/de_results.csv", index=False)
+output_dir = Path(f"data/{cancer_type}/raw")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / "de_results.csv"
+results_df.to_csv(output_path, index=False)
 
-print(f"\n  Output: data/raw/de_results.csv")
-print(f"  Next: Rscript R/00_run_pipeline.R")
+print(f"\n  Output: {output_path}")
+print(f"  Next: DATASET={cancer_type} Rscript R/00_run_pipeline.R")
 print("\n=== Done ===")

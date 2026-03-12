@@ -11,6 +11,7 @@ Input:  data/processed/feature_matrix_train.csv
 Output: results/reports/baseline_label_propagation.md
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -19,13 +20,6 @@ from sklearn.metrics import (
     roc_auc_score, f1_score, matthews_corrcoef, classification_report
 )
 from sklearn.preprocessing import LabelEncoder
-
-# --- Configuration ---
-CONFIG = {
-    "train_file": "data/processed/feature_matrix_train.csv",
-    "network_file": "data/processed/network_features.csv",
-    "reports_dir": "results/reports",
-}
 
 
 def build_similarity_from_features(X, k=10):
@@ -44,8 +38,20 @@ def build_similarity_from_features(X, k=10):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Label propagation baseline")
+    parser.add_argument("--dataset", default="ucec", help="Dataset/cancer type (default: ucec)")
+    args = parser.parse_args()
+    dataset = args.dataset
+
+    CONFIG = {
+        "train_file": f"data/{dataset}/processed/feature_matrix_train.csv",
+        "network_file": f"data/{dataset}/processed/network_features.csv",
+        "reports_dir": f"results/{dataset}/reports",
+    }
+
     print("=" * 60)
     print("  BASELINE: Label Propagation")
+    print(f"  Dataset: {dataset}")
     print("=" * 60)
 
     # Load data

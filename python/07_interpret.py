@@ -13,21 +13,28 @@ Output: results/figures/shap_*.png
         results/reports/interpretation_report.md
 """
 
+import sys
+import argparse
 import numpy as np
 import pandas as pd
 import joblib
 import shap
 from pathlib import Path
+from scipy.stats import fisher_exact
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Ensure the python/ directory is on the path for utils import
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from utils.feature_decoder import decode_feature, get_property_group, PROPERTY_GROUPS
+
 CONFIG = {
-    "train_file": "data/processed/feature_matrix_train.csv",
+    "train_file": "data/ucec/processed/feature_matrix_train.csv",
     "model_dir": "models",
     "figures_dir": "results/figures",
     "reports_dir": "results/reports",
-    "max_samples_shap": 500,  # limit for SHAP computation speed
+    "max_samples_shap": 500,
 }
 
 
@@ -48,6 +55,56 @@ def categorize_feature(name):
         return "Detectability"
     else:
         return "Other"
+
+
+def feature_property_enrichment(feature_importance, n_top=50):
+    """Test whether property groups are enriched among top features.
+
+    Uses Fisher's exact test to check if each property group is
+    over-represented in the top-*n_top* features relative to all features.
+
+    Returns a DataFrame with columns: group, top_count, total_count,
+    odds_ratio, p_value.
+    """
+    all_features = feature_importance["feature"].tolist()
+    top_features = feature_importance.head(n_top)["feature"].tolist()
+
+    n_all = len(all_features)
+    n_top_actual = len(top_features)
+
+    results = []
+    for group_name in list(PROPERTY_GROUPS.keys()) + ["other"]:
+        # Count features belonging to this group across all and top
+        in_group_all = sum(1 for f in all_features if group_name in get_property_group(f))
+        in_group_top = sum(1 for f in top_features if group_name in get_property_group(f))
+
+        not_in_group_all = n_all - in_group_all
+        not_in_group_top = n_top_actual - in_group_top
+
+        # 2x2 contingency table:
+        #                in_top    not_in_top
+        # in_group       a         b
+        # not_in_group   c         d
+        a = in_group_top
+        b = in_group_all - in_group_top
+        c = n_top_actual - in_group_top
+        d = not_in_group_all - c
+
+        table = [[a, b], [c, d]]
+        try:
+            odds_ratio, p_value = fisher_exact(table, alternative="greater")
+        except Exception:
+            odds_ratio, p_value = float("nan"), float("nan")
+
+        results.append({
+            "group": group_name,
+            "top_count": in_group_top,
+            "total_count": in_group_all,
+            "odds_ratio": round(odds_ratio, 2) if not np.isnan(odds_ratio) else "inf",
+            "p_value": round(p_value, 4),
+        })
+
+    return pd.DataFrame(results).sort_values("p_value")
 
 
 def analyze_stage(model_path, X, feature_cols, stage_name, output_dir):
@@ -162,8 +219,18 @@ def analyze_stage(model_path, X, feature_cols, stage_name, output_dir):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="SHAP model interpretation")
+    parser.add_argument("--dataset", default="ucec", help="Dataset/cancer type (default: ucec)")
+    args = parser.parse_args()
+    dataset = args.dataset
+    CONFIG["train_file"] = f"data/{dataset}/processed/feature_matrix_train.csv"
+    CONFIG["model_dir"] = f"models/{dataset}"
+    CONFIG["figures_dir"] = f"results/{dataset}/figures"
+    CONFIG["reports_dir"] = f"results/{dataset}/reports"
+
     print("=" * 60)
     print("  MODEL INTERPRETATION (SHAP)")
+    print(f"  Dataset: {dataset}")
     print("=" * 60)
 
     # Load data
@@ -235,6 +302,61 @@ def main():
         for i, row in importance.head(15).iterrows():
             lines.append(f"| {importance.index.get_loc(i)+1} | `{row['feature']}` | "
                         f"{row['category']} | {row['mean_abs_shap']:.4f} |")
+        lines.append("")
+
+        # --- Biological Interpretation section ---
+        lines.append(f"## Biological Interpretation: {name}\n")
+
+        # Annotated Top 30 table
+        lines.append("### Annotated Top 30 Features\n")
+        lines.append("| Rank | Feature | Description | Category | Mean |SHAP| |")
+        lines.append("|------|---------|-------------|----------|------------|")
+        for idx_pos, (i, row) in enumerate(importance.head(30).iterrows(), 1):
+            desc = decode_feature(row["feature"])
+            lines.append(
+                f"| {idx_pos} | `{row['feature']}` | {desc} | "
+                f"{row['category']} | {row['mean_abs_shap']:.4f} |"
+            )
+        lines.append("")
+
+        # Property enrichment analysis
+        lines.append("### Feature Property Enrichment (Top 50 vs All)\n")
+        enrichment_df = feature_property_enrichment(importance, n_top=50)
+        lines.append("| Property Group | In Top 50 | Total | Odds Ratio | p-value |")
+        lines.append("|---------------|-----------|-------|------------|---------|")
+        for _, erow in enrichment_df.iterrows():
+            lines.append(
+                f"| {erow['group']} | {erow['top_count']} | {erow['total_count']} | "
+                f"{erow['odds_ratio']} | {erow['p_value']:.4f} |"
+            )
+        lines.append("")
+
+        # Narrative interpretation
+        lines.append("### Narrative Interpretation\n")
+        sig_groups = enrichment_df[enrichment_df["p_value"] < 0.05]
+        if len(sig_groups) > 0:
+            group_list = ", ".join(sig_groups["group"].tolist())
+            lines.append(
+                f"Significantly enriched property groups among the top 50 features "
+                f"(Fisher's exact test, p < 0.05): **{group_list}**.\n"
+            )
+            for _, sg in sig_groups.iterrows():
+                lines.append(
+                    f"- **{sg['group']}**: {sg['top_count']} of {sg['total_count']} features "
+                    f"in top 50 (OR={sg['odds_ratio']}, p={sg['p_value']:.4f})"
+                )
+            lines.append("")
+            lines.append(
+                "These enrichments suggest the model relies on specific physicochemical "
+                "and biological properties to distinguish protein expression dynamics, "
+                "rather than arbitrary feature combinations."
+            )
+        else:
+            lines.append(
+                "No property groups were significantly enriched among the top 50 features "
+                "(Fisher's exact test, p < 0.05). This suggests the model draws on a diverse "
+                "set of feature types without strong bias toward any single physicochemical property."
+            )
         lines.append("")
 
     # Key insight

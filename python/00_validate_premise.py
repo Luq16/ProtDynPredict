@@ -17,6 +17,7 @@ Decision criteria:
 """
 
 import sys
+import argparse
 import warnings
 from pathlib import Path
 
@@ -74,38 +75,48 @@ def load_data(path):
     return X, y, protein_ids, feature_cols
 
 
-def approximate_protein_families(X, threshold=0.8):
+def approximate_protein_families(X, feature_cols, threshold=0.5):
     """
-    Approximate protein family clusters from feature similarity.
-    Without CD-HIT, we cluster proteins by correlation of their
-    sequence feature vectors (protr features capture family membership).
+    Approximate protein family clusters from sequence feature similarity.
+    Uses only AAC_* and DC_* columns (amino acid composition and dipeptide
+    composition, ~420 features) with cosine distance.  A distance_threshold
+    of 0.5 roughly approximates 50% sequence identity clustering.
     """
-    print("  Approximating protein families from feature similarity...")
+    print("  Approximating protein families from sequence feature similarity...")
     from sklearn.cluster import AgglomerativeClustering
+    from scipy.spatial.distance import pdist, squareform
 
-    # Use only sequence features (AAC, DC, CTD prefix) if available
-    # For now, use all features with correlation-based distance
-    n = X.shape[0]
+    # Extract only sequence-derived features (AAC and DC columns)
+    seq_idx = [i for i, c in enumerate(feature_cols)
+               if c.startswith("AAC_") or c.startswith("DC_")]
+    if len(seq_idx) == 0:
+        print("  WARNING: No AAC_/DC_ columns found; falling back to all features")
+        X_seq = X
+    else:
+        X_seq = X[:, seq_idx]
+        print(f"  Using {len(seq_idx)} sequence features (AAC + DC) for clustering")
+
+    n = X_seq.shape[0]
     if n > 5000:
-        # Subsample correlation matrix for speed
-        print(f"  Large dataset ({n} proteins), using random subset for clustering...")
-        # Just assign sequential groups for very large datasets
-        n_groups = n // 5
-        groups = np.repeat(np.arange(n_groups), 5)[:n]
+        # For very large datasets use MiniBatchKMeans on sequence features
+        from sklearn.cluster import MiniBatchKMeans
+        n_clusters = max(20, n // 5)
+        print(f"  Large dataset ({n} proteins), using MiniBatchKMeans (k={n_clusters})...")
+        groups = MiniBatchKMeans(n_clusters=n_clusters, random_state=42).fit_predict(X_seq)
+        print(f"  Found {len(np.unique(groups))} approximate protein families")
         return groups
 
-    # Correlation distance
-    from scipy.spatial.distance import pdist, squareform
-    corr_dist = pdist(X, metric="correlation")
-    corr_dist = np.nan_to_num(corr_dist, nan=1.0)
+    # Cosine distance
+    cos_dist = pdist(X_seq, metric="cosine")
+    cos_dist = np.nan_to_num(cos_dist, nan=1.0)
 
     clustering = AgglomerativeClustering(
         n_clusters=None,
-        distance_threshold=1 - threshold,  # correlation to distance
+        distance_threshold=threshold,
         metric="precomputed",
         linkage="average"
     )
-    dist_matrix = squareform(corr_dist)
+    dist_matrix = squareform(cos_dist)
     groups = clustering.fit_predict(dist_matrix)
 
     n_clusters = len(np.unique(groups))
@@ -491,8 +502,17 @@ def generate_report(mask_results, cv_results, classes, output_path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Validate premise (GO/NO-GO gate)")
+    parser.add_argument("--dataset", default="ucec", help="Dataset name (e.g., ucec, coad, brca)")
+    args = parser.parse_args()
+    dataset = args.dataset
+
+    CONFIG["input_file"] = f"data/{dataset}/processed/feature_matrix_train.csv"
+    CONFIG["figures_dir"] = f"results/{dataset}/figures"
+    CONFIG["reports_dir"] = f"results/{dataset}/reports"
+
     print("=" * 60)
-    print("  Phase 2: VALIDATE PREMISE (GO/NO-GO GATE)")
+    print(f"  Phase 2: VALIDATE PREMISE (GO/NO-GO GATE) [{dataset.upper()}]")
     print("=" * 60)
 
     # Load data
@@ -504,7 +524,7 @@ def main():
         sys.exit(1)
 
     # Approximate protein families for grouped splitting
-    groups = approximate_protein_families(X, CONFIG["cluster_corr_threshold"])
+    groups = approximate_protein_families(X, feature_cols)
 
     # Run masking experiment
     print("\n" + "=" * 40)

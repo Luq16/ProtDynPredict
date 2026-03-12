@@ -14,6 +14,7 @@ Output: results/reports/baselines_comparison.md
         results/figures/baselines_comparison.png
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -24,15 +25,6 @@ from sklearn.dummy import DummyClassifier
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-CONFIG = {
-    "train_file": "data/processed/feature_matrix_train.csv",
-    "figures_dir": "results/figures",
-    "reports_dir": "results/reports",
-    "n_iterations": 5,
-    "mask_fraction": 0.20,
-    "random_state": 42,
-}
 
 
 def run_baseline(name, clf_factory, X, y_encoded, classes, n_iter, mask_frac, rng):
@@ -82,14 +74,37 @@ def run_baseline(name, clf_factory, X, y_encoded, classes, n_iter, mask_frac, rn
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Baselines comparison")
+    parser.add_argument("--dataset", default="ucec", help="Dataset/cancer type (default: ucec)")
+    args = parser.parse_args()
+    dataset = args.dataset
+
+    CONFIG = {
+        "train_file": f"data/{dataset}/processed/feature_matrix_train.csv",
+        "figures_dir": f"results/{dataset}/figures",
+        "reports_dir": f"results/{dataset}/reports",
+        "n_iterations": 5,
+        "mask_fraction": 0.20,
+        "random_state": 42,
+    }
+
     print("=" * 60)
     print("  BASELINES COMPARISON")
+    print(f"  Dataset: {dataset}")
     print("=" * 60)
 
     # Load data
     df = pd.read_csv(CONFIG["train_file"])
     meta_cols = ["UniProt_ID", "label", "log2FC", "adj_pvalue"]
     feature_cols = [c for c in df.columns if c not in meta_cols]
+
+    # Remove leaky features (same filtering as 01_train_model.py)
+    leaky_prefixes = [
+        "ppi_frac_neighbors_", "ppi_weighted_frac_",
+        "pw_max_frac_", "pw_mean_frac_",
+        "GO_BP_sim_", "GO_MF_sim_", "GO_CC_sim_"
+    ]
+    feature_cols = [c for c in feature_cols if not any(c.startswith(p) for p in leaky_prefixes)]
 
     X = df[feature_cols].values.astype(np.float32)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -180,12 +195,15 @@ def main():
         import re
         auc_match = re.search(r"\*\*Overall AUC\*\*: ([\d.]+)", content)
         if auc_match:
+            # Extract F1 and MCC from Stage 1 (primary classification stage)
+            f1_match = re.search(r"\*\*F1\*\*: ([\d.]+)", content)
+            mcc_match = re.search(r"\*\*MCC\*\*: ([\d.]+)", content)
             all_baselines.append({
                 "name": "XGBoost (two-stage)",
                 "mean_auc": float(auc_match.group(1)),
                 "std_auc": 0.0,
-                "mean_f1": 0.0,
-                "mean_mcc": 0.0,
+                "mean_f1": float(f1_match.group(1)) if f1_match else 0.0,
+                "mean_mcc": float(mcc_match.group(1)) if mcc_match else 0.0,
             })
 
     # --- Summary table ---
