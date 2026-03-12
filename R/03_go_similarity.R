@@ -21,15 +21,16 @@ suppressPackageStartupMessages({
 })
 
 # --- Configuration ---
+DATASET <- Sys.getenv("DATASET", unset = "ucec")
 CONFIG <- list(
-  input_file  = "data/processed/protein_metadata.rds",
-  output_file = "data/processed/go_features.csv",
-  go_slim_output = "data/processed/go_slim_matrix.csv",
+  input_file  = sprintf("data/%s/processed/protein_metadata.rds", DATASET),
+  output_file = sprintf("data/%s/processed/go_features.csv", DATASET),
+  go_slim_output = sprintf("data/%s/processed/go_slim_matrix.csv", DATASET),
   # Thresholds for labeling (must match 06_assemble_features.R)
-  fc_threshold    = 1.0,
+  fc_threshold    = 0.5,
   pval_threshold  = 0.05,
   unchanged_pval  = 0.20,
-  unchanged_fc    = 0.5
+  unchanged_fc    = 0.25
 )
 
 cat("=== Phase 1.3: GO Semantic Similarity Features ===\n")

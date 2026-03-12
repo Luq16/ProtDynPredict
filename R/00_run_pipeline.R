@@ -9,6 +9,9 @@ cat("============================================\n")
 cat("  ProtDynPredict - Feature Engineering\n")
 cat("============================================\n\n")
 
+DATASET <- Sys.getenv("DATASET", unset = "ucec")
+cat(sprintf("  Dataset: %s\n\n", DATASET))
+
 # --- Check dependencies ---
 cat("Checking R package dependencies...\n")
 required_packages <- c(
@@ -42,11 +45,12 @@ if (length(missing) > 0) {
 cat("  All packages available.\n\n")
 
 # --- Check input data ---
-if (!file.exists("data/raw/de_results.csv")) {
-  stop("Input file not found: data/raw/de_results.csv\n",
+de_input <- sprintf("data/%s/raw/de_results.csv", DATASET)
+if (!file.exists(de_input)) {
+  stop(sprintf("Input file not found: %s\n", de_input),
        "  Place your differential expression results there with columns:\n",
        "  UniProt_ID, log2FC, adj_pvalue\n\n",
-       "  Or run: Rscript R/generate_sample_data.R")
+       "  Or run: python python/fetch_cptac_data.py ", DATASET)
 }
 
 # --- Run pipeline ---

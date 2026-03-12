@@ -16,25 +16,32 @@ Output: results/predictions.csv
         results/reports/prediction_report.md
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import joblib
 from pathlib import Path
 
-CONFIG = {
-    "predict_file": "data/processed/feature_matrix_predict.csv",
-    "train_file": "data/processed/feature_matrix_train.csv",
-    "model_dir": "models",
-    "output_csv": "results/predictions.csv",
-    "reports_dir": "results/reports",
-    "de_threshold": 0.5,     # Stage 1 probability threshold
-    "high_confidence": 0.7,  # threshold for "high confidence" predictions
-}
-
 
 def main():
+    parser = argparse.ArgumentParser(description="Predict undetected proteins")
+    parser.add_argument("--dataset", default="ucec", help="Dataset/cancer type (default: ucec)")
+    args = parser.parse_args()
+    dataset = args.dataset
+
+    CONFIG = {
+        "predict_file": f"data/{dataset}/processed/feature_matrix_predict.csv",
+        "train_file": f"data/{dataset}/processed/feature_matrix_train.csv",
+        "model_dir": f"models/{dataset}",
+        "output_csv": f"results/{dataset}/predictions.csv",
+        "reports_dir": f"results/{dataset}/reports",
+        "de_threshold": 0.5,
+        "high_confidence": 0.7,
+    }
+
     print("=" * 60)
     print("  PREDICTION: Undetected Proteins")
+    print(f"  Dataset: {dataset}")
     print("=" * 60)
 
     # Load models

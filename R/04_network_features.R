@@ -20,15 +20,16 @@ suppressPackageStartupMessages({
 })
 
 # --- Configuration ---
+DATASET <- Sys.getenv("DATASET", unset = "ucec")
 CONFIG <- list(
-  input_file  = "data/processed/protein_metadata.rds",
-  output_file = "data/processed/network_features.csv",
-  pathway_output = "data/processed/pathway_membership.csv",
+  input_file  = sprintf("data/%s/processed/protein_metadata.rds", DATASET),
+  output_file = sprintf("data/%s/processed/network_features.csv", DATASET),
+  pathway_output = sprintf("data/%s/processed/pathway_membership.csv", DATASET),
   # Label thresholds (must match 03 and 06)
-  fc_threshold    = 1.0,
+  fc_threshold    = 0.5,
   pval_threshold  = 0.05,
   unchanged_pval  = 0.20,
-  unchanged_fc    = 0.5
+  unchanged_fc    = 0.25
 )
 
 cat("=== Phase 1.4: Network Features ===\n")

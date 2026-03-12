@@ -13,15 +13,16 @@ suppressPackageStartupMessages({
 })
 
 # --- Configuration ---
+DATASET <- Sys.getenv("DATASET", unset = "ucec")
 CONFIG <- list(
-  metadata_file   = "data/processed/protein_metadata.rds",
-  seq_features    = "data/processed/sequence_features.csv",
-  go_features     = "data/processed/go_features.csv",
-  net_features    = "data/processed/network_features.csv",
-  det_features    = "data/processed/detectability_features.csv",
-  output_train    = "data/processed/feature_matrix_train.csv",
-  output_predict  = "data/processed/feature_matrix_predict.csv",
-  output_summary  = "data/processed/feature_summary.txt",
+  metadata_file   = sprintf("data/%s/processed/protein_metadata.rds", DATASET),
+  seq_features    = sprintf("data/%s/processed/sequence_features.csv", DATASET),
+  go_features     = sprintf("data/%s/processed/go_features.csv", DATASET),
+  net_features    = sprintf("data/%s/processed/network_features.csv", DATASET),
+  det_features    = sprintf("data/%s/processed/detectability_features.csv", DATASET),
+  output_train    = sprintf("data/%s/processed/feature_matrix_train.csv", DATASET),
+  output_predict  = sprintf("data/%s/processed/feature_matrix_predict.csv", DATASET),
+  output_summary  = sprintf("data/%s/processed/feature_summary.txt", DATASET),
   # Label thresholds (0.5 FC for proteomics — 1.0 too strict for CPTAC)
   fc_threshold    = 0.5,
   pval_threshold  = 0.05,

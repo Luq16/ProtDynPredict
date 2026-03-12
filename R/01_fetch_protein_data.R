@@ -16,10 +16,11 @@ suppressPackageStartupMessages({
 })
 
 # --- Configuration ---
+DATASET <- Sys.getenv("DATASET", unset = "ucec")
 CONFIG <- list(
-  input_file      = "data/raw/de_results.csv",
-  output_file     = "data/processed/protein_metadata.rds",
-  ppi_output      = "data/processed/ppi_network.rds",
+  input_file      = sprintf("data/%s/raw/de_results.csv", DATASET),
+  output_file     = sprintf("data/%s/processed/protein_metadata.rds", DATASET),
+  ppi_output      = sprintf("data/%s/processed/ppi_network.rds", DATASET),
   species         = 9606,
   string_version  = "12.0",
   string_score_threshold = 400

@@ -11,9 +11,10 @@ suppressPackageStartupMessages({
 })
 
 # --- Configuration ---
+DATASET <- Sys.getenv("DATASET", unset = "ucec")
 CONFIG <- list(
-  input_file  = "data/processed/protein_metadata.rds",
-  output_file = "data/processed/detectability_features.csv"
+  input_file  = sprintf("data/%s/processed/protein_metadata.rds", DATASET),
+  output_file = sprintf("data/%s/processed/detectability_features.csv", DATASET)
 )
 
 cat("=== Phase 1.5: Detectability Features ===\n")

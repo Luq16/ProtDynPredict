@@ -14,6 +14,7 @@ Output: models/stage1_model.joblib
         results/reports/training_report.md
 """
 
+import argparse
 import warnings
 from pathlib import Path
 
@@ -42,6 +43,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 CONFIG = {
     "input_file": "data/processed/feature_matrix_train.csv",
     "model_dir": "models",
+    "results_dir": "results",
     "figures_dir": "results/figures",
     "reports_dir": "results/reports",
     "n_folds": 5,
@@ -94,20 +96,34 @@ def load_and_prepare(path):
     return X, y_stage1, y_stage2, de_mask.values, feature_cols, protein_ids
 
 
-def get_protein_groups(X, n_min_groups=20):
-    """Cluster proteins into families for grouped CV."""
-    n = X.shape[0]
+def get_protein_groups(X, feature_cols, n_min_groups=20):
+    """Cluster proteins into families for grouped CV.
+
+    Uses only sequence-derived features (AAC_* and DC_*) with cosine
+    distance to approximate protein family membership (~50 % seq identity).
+    """
+    # Extract sequence features
+    seq_idx = [i for i, c in enumerate(feature_cols)
+               if c.startswith("AAC_") or c.startswith("DC_")]
+    if len(seq_idx) == 0:
+        print("  WARNING: No AAC_/DC_ columns found; falling back to all features")
+        X_seq = X
+    else:
+        X_seq = X[:, seq_idx]
+        print(f"  Using {len(seq_idx)} sequence features (AAC + DC) for clustering")
+
+    n = X_seq.shape[0]
     if n > 3000:
         # For large datasets, use faster approximate grouping
         from sklearn.cluster import MiniBatchKMeans
         n_clusters = max(n_min_groups, n // 5)
-        groups = MiniBatchKMeans(n_clusters=n_clusters, random_state=42).fit_predict(X)
+        groups = MiniBatchKMeans(n_clusters=n_clusters, random_state=42).fit_predict(X_seq)
     else:
-        corr_dist = pdist(X, metric="correlation")
-        corr_dist = np.nan_to_num(corr_dist, nan=1.0)
-        dist_matrix = squareform(corr_dist)
+        cos_dist = pdist(X_seq, metric="cosine")
+        cos_dist = np.nan_to_num(cos_dist, nan=1.0)
+        dist_matrix = squareform(cos_dist)
         clustering = AgglomerativeClustering(
-            n_clusters=None, distance_threshold=0.3,
+            n_clusters=None, distance_threshold=0.5,
             metric="precomputed", linkage="average"
         )
         groups = clustering.fit_predict(dist_matrix)
@@ -197,6 +213,7 @@ def train_final_model(X, y, params, groups, n_folds, seed, stage_name):
     all_y_true = []
     all_y_pred = []
     all_y_proba = []
+    all_fold_ids = []   # track which fold each sample belongs to
     fold_aucs = []
 
     for fold, (train_idx, val_idx) in enumerate(splits):
@@ -218,6 +235,7 @@ def train_final_model(X, y, params, groups, n_folds, seed, stage_name):
         all_y_true.extend(y_true)
         all_y_pred.extend(y_pred)
         all_y_proba.extend(y_proba)
+        all_fold_ids.extend([fold] * len(y_true))
 
         print(f"  Fold {fold+1}: AUC={auc:.3f}")
 
@@ -232,6 +250,7 @@ def train_final_model(X, y, params, groups, n_folds, seed, stage_name):
         "y_true": np.array(all_y_true),
         "y_pred": np.array(all_y_pred),
         "y_proba": np.array(all_y_proba),
+        "fold_ids": np.array(all_fold_ids),
     }
 
     overall_auc = roc_auc_score(cv_metrics["y_true"], cv_metrics["y_proba"])
@@ -339,15 +358,26 @@ def generate_training_report(s1_params, s1_metrics, s2_params, s2_metrics,
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train two-stage XGBoost model")
+    parser.add_argument("--dataset", default="ucec", help="Dataset name (e.g., ucec, coad, brca)")
+    args = parser.parse_args()
+    dataset = args.dataset
+
+    CONFIG["input_file"] = f"data/{dataset}/processed/feature_matrix_train.csv"
+    CONFIG["model_dir"] = f"models/{dataset}"
+    CONFIG["results_dir"] = f"results/{dataset}"
+    CONFIG["figures_dir"] = f"results/{dataset}/figures"
+    CONFIG["reports_dir"] = f"results/{dataset}/reports"
+
     print("=" * 60)
-    print("  Phase 3: MODEL TRAINING (Two-Stage XGBoost)")
+    print(f"  Phase 3: MODEL TRAINING (Two-Stage XGBoost) [{dataset.upper()}]")
     print("=" * 60)
 
     # Load data
     X, y_s1, y_s2, de_mask, feature_cols, protein_ids = load_and_prepare(CONFIG["input_file"])
 
     # Protein family groups
-    groups = get_protein_groups(X)
+    groups = get_protein_groups(X, feature_cols)
     groups_de = groups[de_mask]
 
     # --- Stage 1: DE vs Unchanged ---
@@ -391,7 +421,7 @@ def main():
         "params": s1_params,
         "feature_cols": feature_cols,
         "metrics": {k: v for k, v in s1_metrics.items()
-                    if k not in ("y_true", "y_pred", "y_proba")},
+                    if k not in ("y_true", "y_pred", "y_proba", "fold_ids")},
     }, model_dir / "stage1_model.joblib")
 
     if s2_model is not None:
@@ -400,10 +430,35 @@ def main():
             "params": s2_params,
             "feature_cols": feature_cols,
             "metrics": {k: v for k, v in s2_metrics.items()
-                        if k not in ("y_true", "y_pred", "y_proba")},
+                        if k not in ("y_true", "y_pred", "y_proba", "fold_ids")},
         }, model_dir / "stage2_model.joblib")
 
     print(f"\n  Models saved to {model_dir}/")
+
+    # --- Save CV predictions ---
+    results_dir = Path(CONFIG["results_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez(
+        results_dir / "cv_predictions_stage1.npz",
+        y_true=s1_metrics["y_true"],
+        y_proba=s1_metrics["y_proba"],
+        y_pred=s1_metrics["y_pred"],
+        fold_aucs=np.array(s1_metrics["fold_aucs"]),
+        fold_ids=s1_metrics["fold_ids"],
+    )
+    print(f"  Stage 1 CV predictions saved to {results_dir / 'cv_predictions_stage1.npz'}")
+
+    if s2_metrics is not None:
+        np.savez(
+            results_dir / "cv_predictions_stage2.npz",
+            y_true=s2_metrics["y_true"],
+            y_proba=s2_metrics["y_proba"],
+            y_pred=s2_metrics["y_pred"],
+            fold_aucs=np.array(s2_metrics["fold_aucs"]),
+            fold_ids=s2_metrics["fold_ids"],
+        )
+        print(f"  Stage 2 CV predictions saved to {results_dir / 'cv_predictions_stage2.npz'}")
 
     # --- Plots and report ---
     plot_training_results(s1_metrics, s2_metrics, s1_model, s2_model,
