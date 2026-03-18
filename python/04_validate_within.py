@@ -4,7 +4,7 @@
 Rigorous within-experiment validation for ProtDynPredict.
 
 Validation sections:
-  1. Permutation test (100 shuffles) — empirical p-value for Stage 1 AUC
+  1. Permutation test (1000 shuffles) — empirical p-value for Stage 1 AUC
   2. Bootstrap confidence intervals (1000 iterations) — 95% CI for AUC, F1, MCC
   3. Threshold sensitivity — AUC stability across FC thresholds
   4. Calibration curve — reliability diagram + Brier score
@@ -50,7 +50,7 @@ CONFIG = {
     "results_dir": "results",
     "figures_dir": "results/figures",
     "reports_dir": "results/reports",
-    "n_permutations": 100,
+    "n_permutations": 1000,
     "n_bootstraps": 1000,
     "n_folds": 5,
     "random_state": 42,
@@ -662,7 +662,12 @@ def main():
                         help="Dataset name (e.g., ucec, coad, brca)")
     parser.add_argument("--skip-permutation", action="store_true",
                         help="Skip the slow permutation test.")
+    parser.add_argument("--permutations", type=int, default=None,
+                        help="Number of permutation iterations (default: 1000)")
     args = parser.parse_args()
+
+    if args.permutations is not None:
+        CONFIG["n_permutations"] = args.permutations
 
     print("=" * 60)
     print("  Phase 4: WITHIN-EXPERIMENT VALIDATION")
