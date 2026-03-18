@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import ttest_rel
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 import xgboost as xgb
@@ -72,7 +73,7 @@ def _matches_category(col, prefixes):
 
 
 def cv_auc(X, y, n_folds=5, seed=42):
-    """5-fold stratified CV mean AUC."""
+    """5-fold stratified CV mean AUC. Returns (mean, std, fold_aucs)."""
     cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     scale_pos = np.sum(y == 0) / max(np.sum(y == 1), 1)
     params = {**XGB_PARAMS, "scale_pos_weight": scale_pos}
@@ -85,7 +86,8 @@ def cv_auc(X, y, n_folds=5, seed=42):
             aucs.append(roc_auc_score(y[va], prob))
         except ValueError:
             aucs.append(0.5)
-    return float(np.mean(aucs)), float(np.std(aucs))
+    fold_aucs = np.array(aucs)
+    return float(np.mean(fold_aucs)), float(np.std(fold_aucs)), fold_aucs
 
 
 def main():
@@ -116,11 +118,12 @@ def main():
 
     # ── Baseline (all features) ──────────────────────────────────────────
     print("Training baseline (all features)...")
-    base_auc, base_std = cv_auc(X_all, y)
+    base_auc, base_std, base_folds = cv_auc(X_all, y)
     print(f"  Baseline AUC: {base_auc:.4f} +/- {base_std:.4f}\n")
 
     # ── Ablation per category ────────────────────────────────────────────
-    results = [("All features", base_auc, base_std, 0.0, len(all_features))]
+    # results: (name, auc, std, delta, n_features, p_value)
+    results = [("All features", base_auc, base_std, 0.0, len(all_features), None)]
 
     for cat_name, prefixes in CATEGORIES.items():
         keep_idx = [i for i, c in enumerate(all_features)
@@ -132,18 +135,22 @@ def main():
 
         X_abl = X_all[:, keep_idx]
         print(f"Training without {cat_name} ({n_removed} features removed)...")
-        auc, std = cv_auc(X_abl, y)
+        auc, std, fold_aucs = cv_auc(X_abl, y)
         delta = auc - base_auc
-        print(f"  AUC: {auc:.4f} +/- {std:.4f}  (delta {delta:+.4f})")
-        results.append((f"w/o {cat_name}", auc, std, delta, len(keep_idx)))
+
+        # Paired t-test: compare per-fold AUCs to baseline
+        t_stat, p_val = ttest_rel(base_folds, fold_aucs)
+        print(f"  AUC: {auc:.4f} +/- {std:.4f}  (delta {delta:+.4f}, "
+              f"paired t-test p={p_val:.4f})")
+        results.append((f"w/o {cat_name}", auc, std, delta, len(keep_idx), p_val))
 
     # ── Bar chart ────────────────────────────────────────────────────────
     labels = [r[0] for r in results]
     aucs = [r[1] for r in results]
     stds = [r[2] for r in results]
 
-    colors = ["#2c7bb6"] + ["#d7191c" if r[3] < -0.005 else "#fdae61"
-                             for r in results[1:]]
+    colors = ["#2c7bb6"] + ["#d7191c" if (r[3] < -0.005 and r[5] is not None and r[5] < 0.05)
+                             else "#fdae61" for r in results[1:]]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(len(labels))
@@ -182,24 +189,36 @@ def main():
         "A 5-fold stratified CV XGBoost (Stage 1: DE vs unchanged) is trained",
         "and the mean AUC compared to the full-feature baseline.\n",
         "## Results\n",
-        "| Condition | # Features | AUC (mean +/- std) | Delta AUC |",
-        "|-----------|------------|--------------------|-----------:|",
+        "| Condition | # Features | AUC (mean +/- std) | Delta AUC | Paired t-test p |",
+        "|-----------|------------|--------------------|-----------:|----------------:|",
     ]
-    for name, auc, std, delta, nf in results:
+    for name, auc, std, delta, nf, pval in results:
+        pval_str = "—" if pval is None else f"{pval:.4f}"
+        sig_str = ""
+        if pval is not None and pval < 0.05:
+            sig_str = " *"
         lines.append(f"| {name} | {nf} | {auc:.4f} +/- {std:.4f} | "
-                     f"{delta:+.4f} |")
+                     f"{delta:+.4f} | {pval_str}{sig_str} |")
 
-    lines.append("\n## Interpretation\n")
+    lines.append("\n\\* p < 0.05 (statistically significant difference from baseline)\n")
+    lines.append("## Interpretation\n")
     # Sort ablations by impact (most negative delta first)
     ablations = [r for r in results if r[0] != "All features"]
     ablations.sort(key=lambda r: r[3])
     if ablations:
         worst = ablations[0]
         lines.append(f"- **Most impactful category**: {worst[0]} "
-                     f"(AUC drop {worst[3]:+.4f})")
+                     f"(AUC drop {worst[3]:+.4f}, p={worst[5]:.4f})")
         best = ablations[-1]
         lines.append(f"- **Least impactful category**: {best[0]} "
-                     f"(AUC change {best[3]:+.4f})")
+                     f"(AUC change {best[3]:+.4f}, p={best[5]:.4f})")
+        sig_ablations = [r for r in ablations if r[5] is not None and r[5] < 0.05]
+        if sig_ablations:
+            lines.append(f"- **Statistically significant ablations** (paired t-test, "
+                         f"p < 0.05): {', '.join(r[0] for r in sig_ablations)}")
+        else:
+            lines.append("- No ablation showed a statistically significant AUC "
+                         "difference from baseline (paired t-test, p < 0.05)")
 
     lines.append("\n![Feature Ablation](../figures/feature_ablation.png)\n")
     lines.append("*Generated by `04b_feature_ablation.py`*\n")
@@ -212,8 +231,9 @@ def main():
     print("\n" + "=" * 60)
     print("  FEATURE ABLATION COMPLETE")
     print(f"  Baseline AUC: {base_auc:.4f}")
-    for name, auc, std, delta, nf in results[1:]:
-        print(f"  {name}: {auc:.4f} ({delta:+.4f})")
+    for name, auc, std, delta, nf, pval in results[1:]:
+        pval_str = f", p={pval:.4f}" if pval is not None else ""
+        print(f"  {name}: {auc:.4f} ({delta:+.4f}{pval_str})")
     print("=" * 60)
 
 
