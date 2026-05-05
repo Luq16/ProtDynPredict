@@ -68,6 +68,8 @@ CONFIG = {
 REPORT_ORDER = [
     ("validation_report.md", "Premise Validation"),
     ("training_report.md", "Model Training"),
+    ("model_improvement_report.md", "Improved Stage 1 Model"),
+    ("model_improvement_stage2_report.md", "Improved Stage 2 Model"),
     ("baseline_label_propagation.md", "Label Propagation Baseline"),
     ("baselines_comparison.md", "Baselines Comparison"),
     ("within_validation_report.md", "Within-Dataset Validation"),
@@ -142,34 +144,91 @@ def extract_metrics_from_report(filepath):
         if baselines:
             metrics["baselines"] = baselines
 
-    # Feature category contributions (line-by-line to avoid cross-line matches)
-    cat_rows = []
-    for line in text.splitlines():
-        m = re.match(r"\|\s*([^|]+?)\s*\|\s*([0-9]+\.[0-9]+)%\s*\|", line)
-        if m:
-            cat_rows.append((m.group(1), m.group(2)))
-    if cat_rows:
-        categories = {}
-        for cat, pct in cat_rows:
-            cat = cat.strip()
-            if cat.lower() in ("category",):
-                continue
-            categories[cat] = float(pct)
-        if categories:
-            metrics["feature_categories"] = categories
+    def _extract_stage_block(header: str, stop_headers: list[str]) -> str:
+        start = text.find(header)
+        if start == -1:
+            return ""
+        end = len(text)
+        for stop in stop_headers:
+            idx = text.find(stop, start + len(header))
+            if idx != -1 and idx < end:
+                end = idx
+        return text[start:end]
 
-    # SHAP top features
-    shap_rows = re.findall(
-        r"\|\s*(\d+)\s*\|\s*`(.+?)`\s*\|\s*(.+?)\s*\|\s*([0-9]+\.[0-9]+)\s*\|",
+    # Feature category contributions and SHAP top features are extracted stage-wise
+    # to avoid Stage 2 tables overwriting Stage 1 metrics in the summary.
+    stage1_text = _extract_stage_block("## Stage 1", ["## Stage 2"])
+    if stage1_text:
+        cat_rows = []
+        for line in stage1_text.splitlines():
+            m = re.match(r"\|\s*([^|]+?)\s*\|\s*([0-9]+\.[0-9]+)%\s*\|", line)
+            if m:
+                cat_rows.append((m.group(1), m.group(2)))
+        if cat_rows:
+            categories = {}
+            for cat, pct in cat_rows:
+                cat = cat.strip()
+                if cat.lower() in ("category",):
+                    continue
+                categories[cat] = float(pct)
+            if categories:
+                metrics["stage1_feature_categories"] = categories
+                metrics["feature_categories"] = categories
+
+        shap_rows = re.findall(
+            r"\|\s*(\d+)\s*\|\s*`(.+?)`\s*\|\s*(.+?)\s*\|\s*([0-9]+\.[0-9]+)\s*\|",
+            stage1_text,
+        )
+        if shap_rows:
+            metrics["stage1_shap_features"] = [
+                {"rank": int(r), "feature": f, "category": c.strip(), "mean_shap": float(v)}
+                for r, f, c, v in shap_rows
+            ]
+            metrics["shap_features"] = metrics["stage1_shap_features"]
+
+    # Orthogonal-validation metrics
+    rho_m = re.search(r"Spearman rho:\*\*\s*([0-9]+\.[0-9]+)", text)
+    matched_m = re.search(r"Matched genes:\*\*\s*(\d+)", text)
+    protein_fisher_m = re.search(
+        r"Protein-DE vs mRNA DE.*?Fisher exact: OR = ([0-9.]+), p = ([0-9.eE+-]+)",
         text,
+        re.DOTALL,
     )
-    if shap_rows:
-        metrics["shap_features"] = [
-            {"rank": int(r), "feature": f, "category": c.strip(), "mean_shap": float(v)}
-            for r, f, c, v in shap_rows
-        ]
+    model_fisher_m = re.search(
+        r"Model-predicted DE vs mRNA DE.*?Fisher exact: OR = ([0-9.]+), p = ([0-9.eE+-]+)",
+        text,
+        re.DOTALL,
+    )
+    predicted_de_m = re.search(r"Predicted DE proteins:\*\*\s*(\d+)\s*/\s*(\d+)", text)
+    sig_terms_m = re.search(r"Significant terms.*?:\*\*\s*(\d+)", text)
+
+    if rho_m:
+        metrics["orthogonal_spearman_rho"] = rho_m.group(1)
+    if matched_m:
+        metrics["orthogonal_matched_genes"] = matched_m.group(1)
+    if protein_fisher_m:
+        metrics["orthogonal_protein_mrna_or"] = protein_fisher_m.group(1)
+    if model_fisher_m:
+        metrics["orthogonal_model_mrna_or"] = model_fisher_m.group(1)
+    if predicted_de_m:
+        metrics["orthogonal_predicted_de_n"] = predicted_de_m.group(1)
+        metrics["orthogonal_predicted_de_total"] = predicted_de_m.group(2)
+    if sig_terms_m:
+        metrics["orthogonal_sig_terms"] = sig_terms_m.group(1)
 
     return metrics
+
+
+def resolve_cross_report_path(config):
+    """Return the preferred cross-dataset report path, with fallback."""
+    candidates = [
+        Path(config["reports_dir"]) / "cross_validation_report.md",
+        Path("results/cross_dataset/reports/cross_validation_report.md"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
 
 
 # ── Supplementary table generators ──────────────────────────────────────
@@ -209,21 +268,45 @@ def generate_shap_table(model_dir, data_dir):
             df = pd.read_csv(train_path)
             meta_cols = {"UniProt_ID", "label", "log2FC", "adj_pvalue"}
 
-            for stage_tag, model_file, mask_fn in [
-                ("Stage1_DE_vs_Unchanged", "stage1_model.joblib", None),
-                ("Stage2_Up_vs_Down", "stage2_model.joblib",
+            for stage_tag, model_candidates, mask_fn in [
+                ("Stage1_DE_vs_Unchanged",
+                 ["stage1_improved_model.joblib", "stage1_model.joblib"],
+                 None),
+                ("Stage2_Up_vs_Down",
+                 ["stage2_improved_model.joblib", "stage2_model.joblib"],
                  lambda d: d["label"].isin(["up", "down"])),
             ]:
-                model_path = Path(model_dir) / model_file
-                if not model_path.exists():
+                model_path = next(
+                    (Path(model_dir) / model_file
+                     for model_file in model_candidates
+                     if (Path(model_dir) / model_file).exists()),
+                    None
+                )
+                if model_path is None:
                     continue
                 try:
                     data = joblib.load(model_path)
                     model = data["model"]
-                    feature_cols = data.get("feature_cols",
-                                            [c for c in df.columns if c not in meta_cols])
-                    X = df[feature_cols].values.astype(np.float32)
-                    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+                    feature_type = data.get("feature_type", "full")
+                    if feature_type == "non-sequence":
+                        feature_cols = data.get("feature_cols") or data.get("nonseq_cols")
+                        X = df[feature_cols].values.astype(np.float32)
+                        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+                    elif feature_type == "pca":
+                        seq_cols = data["seq_cols"]
+                        nonseq_cols = data["nonseq_cols"]
+                        X_seq = df[seq_cols].values.astype(np.float32)
+                        X_seq = np.nan_to_num(X_seq, nan=0.0, posinf=0.0, neginf=0.0)
+                        X_nonseq = df[nonseq_cols].values.astype(np.float32)
+                        X_nonseq = np.nan_to_num(X_nonseq, nan=0.0, posinf=0.0, neginf=0.0)
+                        X_pca = data["pca"].transform(data["scaler"].transform(X_seq))
+                        X = np.hstack([X_pca, X_nonseq])
+                        feature_cols = [f"PC{i+1}" for i in range(X_pca.shape[1])] + nonseq_cols
+                    else:
+                        feature_cols = data.get("feature_cols",
+                                                [c for c in df.columns if c not in meta_cols])
+                        X = df[feature_cols].values.astype(np.float32)
+                        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
                     if mask_fn is not None:
                         mask = mask_fn(df).values
@@ -285,7 +368,7 @@ def generate_shap_table(model_dir, data_dir):
 
 def generate_cross_dataset_table(reports_dir):
     """Table S3: Cross-dataset results matrix (if available)."""
-    cross_path = Path(reports_dir) / "cross_validation_report.md"
+    cross_path = resolve_cross_report_path({"reports_dir": reports_dir})
     if not cross_path.exists():
         print("  [SKIP] Table S3 - cross-dataset report not found")
         return None
@@ -299,43 +382,33 @@ def generate_cross_dataset_table(reports_dir):
     )
     section_text = section_match.group(0) if section_match else text
 
-    # Try to parse cross-dataset table (format from 05_validate_cross.py):
-    # | Train | Test | Stage | AUC | F1 | MCC |
-    rows = re.findall(
-        r"\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([0-9]+\.[0-9]+|N/A)\s*\|\s*([0-9]+\.[0-9]+)\s*\|\s*([0-9.-]+)\s*\|",
-        section_text,
-    )
-    if not rows:
-        # Fallback: try simpler 3-column format
-        rows = re.findall(
-            r"\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*([0-9]+\.[0-9]+)\s*\|",
-            section_text,
-        )
-        if not rows:
-            print("  [SKIP] Table S3 - could not parse cross-dataset table")
-            return None
+    results = []
+    for line in section_text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        if "Train | Test | Stage | AUC | F1 | MCC" in line:
+            continue
+        if "Training Set | Held-Out | Stage | AUC | F1 | MCC" in line:
+            continue
+        if "---" in line:
+            continue
 
-        results = []
-        for cols in rows:
-            if any(h in cols[0].lower() for h in ("train", "source", "---")):
-                continue
+        cols = [c.strip() for c in line.strip("|").split("|")]
+        if len(cols) == 6:
             results.append({
-                "train_dataset": cols[0].strip(),
-                "test_dataset": cols[1].strip(),
-                "auc": cols[2].strip(),
+                "train_dataset": cols[0],
+                "test_dataset": cols[1],
+                "stage": cols[2],
+                "auc": cols[3],
+                "f1": cols[4],
+                "mcc": cols[5],
             })
-    else:
-        results = []
-        for cols in rows:
-            if any(h in cols[0].lower() for h in ("train", "source", "---", "training")):
-                continue
+        elif len(cols) == 3:
             results.append({
-                "train_dataset": cols[0].strip(),
-                "test_dataset": cols[1].strip(),
-                "stage": cols[2].strip(),
-                "auc": cols[3].strip(),
-                "f1": cols[4].strip(),
-                "mcc": cols[5].strip(),
+                "train_dataset": cols[0],
+                "test_dataset": cols[1],
+                "auc": cols[2],
             })
 
     if not results:
@@ -473,11 +546,32 @@ def generate_publication_summary(all_metrics, dataset, config):
 
     training = all_metrics.get("training_report.md", {})
     validation = all_metrics.get("validation_report.md", {})
+    improvement_path = Path(config["reports_dir"]) / "model_improvement_report.md"
+    improvement_text = improvement_path.read_text() if improvement_path.exists() else ""
+    improvement_stage2_path = Path(config["reports_dir"]) / "model_improvement_stage2_report.md"
+    improvement_stage2_text = (
+        improvement_stage2_path.read_text() if improvement_stage2_path.exists() else ""
+    )
 
-    s1_auc = training.get("stage1_auc", "N/A")
-    s1_std = training.get("stage1_auc_std", None)
-    s2_auc = training.get("stage2_auc", "N/A")
-    s2_std = training.get("stage2_auc_std", None)
+    s1_match = re.search(r"\*\*AUC\*\*:\s*([0-9]+\.[0-9]+).*?folds:\s*([0-9]+\.[0-9]+)\+/-([0-9]+\.[0-9]+)",
+                         improvement_text, re.DOTALL)
+    if s1_match:
+        s1_auc = f"{float(s1_match.group(1)):.3f}"
+        s1_std = s1_match.group(3)
+    else:
+        s1_auc = training.get("stage1_auc", "N/A")
+        s1_std = training.get("stage1_auc_std", None)
+    s2_match = re.search(
+        r"\*\*AUC\*\*:\s*([0-9]+\.[0-9]+).*?folds:\s*([0-9]+\.[0-9]+)\+/-([0-9]+\.[0-9]+)",
+        improvement_stage2_text,
+        re.DOTALL,
+    )
+    if s2_match:
+        s2_auc = f"{float(s2_match.group(1)):.3f}"
+        s2_std = s2_match.group(3)
+    else:
+        s2_auc = training.get("stage2_auc", "N/A")
+        s2_std = training.get("stage2_auc_std", None)
 
     s1_line = f"- **Stage 1** (DE vs Unchanged): AUC = {s1_auc}"
     if s1_std:
@@ -498,7 +592,16 @@ def generate_publication_summary(all_metrics, dataset, config):
     if val_auc:
         lines.append(f"- **Premise validation AUC** (masking experiment): {val_auc}")
 
-    lines.append("- Calibration: Brier score = 0.2125 (post-hoc calibration recommended for probability estimates)")
+    within_path = Path(config["reports_dir"]) / "within_validation_report.md"
+    within_text = within_path.read_text() if within_path.exists() else ""
+    brier_match = re.search(r"\*\*Brier score\*\*: ([0-9.]+)", within_text)
+    improved_brier_match = re.search(r"\*\*Brier \(uncalibrated\)\*\*:\s*([0-9]+\.[0-9]+)", improvement_text)
+    if improved_brier_match:
+        brier_match = improved_brier_match
+    if brier_match:
+        lines.append(f"- Calibration: Brier score = {brier_match.group(1)}")
+    else:
+        lines.append("- Calibration: Brier score not found")
     lines.append("")
 
     # Baselines table
@@ -514,7 +617,7 @@ def generate_publication_summary(all_metrics, dataset, config):
 
     # --- 3. Cross-Dataset Generalization ---
     lines.append("## 3. Cross-Dataset Generalization\n")
-    cross_path = Path(config["reports_dir"]) / "cross_validation_report.md"
+    cross_path = resolve_cross_report_path(config)
     if cross_path.exists():
         cross_text = cross_path.read_text()
         # Only extract tables from Section 1 and Section 2 (not Section 4 per-class breakdown)
@@ -546,7 +649,7 @@ def generate_publication_summary(all_metrics, dataset, config):
     # --- 4. Feature Importance ---
     lines.append("## 4. Feature Importance\n")
     interp = all_metrics.get("interpretation_report.md", {})
-    cats = interp.get("feature_categories")
+    cats = interp.get("stage1_feature_categories") or interp.get("feature_categories")
     if cats:
         lines.append("### Feature Category Contributions (Stage 1 SHAP)\n")
         lines.append("| Category | % Importance |")
@@ -569,7 +672,7 @@ def generate_publication_summary(all_metrics, dataset, config):
             lines.append(f"**Key finding**: Mixed signal — Sequence: {seq_pct:.0f}%, Network: {net_pct:.0f}%,")
             lines.append("indicating multiple feature types contribute.\n")
 
-    shap_feats = interp.get("shap_features")
+    shap_feats = interp.get("stage1_shap_features") or interp.get("shap_features")
     if shap_feats:
         lines.append("### Top 10 Individual Features\n")
         lines.append("| Rank | Feature | Description | Category | Mean |SHAP| |")
@@ -591,7 +694,10 @@ def generate_publication_summary(all_metrics, dataset, config):
         rho_m = re.search(r"Spearman rho.*?([0-9]+\.[0-9]+)", ortho_text)
         fisher_m = re.search(r"Odds ratio:\s*([0-9.]+)", ortho_text)
         matched_m = re.search(r"Matched genes.*?(\d+)", ortho_text)
-        sig_terms_m = re.search(r"Significant.*?FDR.*?:\s*(\d+)", ortho_text)
+        sig_terms_m = re.search(r"Significant.*?\):\*\*\s*(\d+)", ortho_text)
+        de_pred_m = re.search(r"\*\*DE proteins:\*\*\s*(\d+)\s*/\s*(\d+)", ortho_text)
+        model_fisher_m = re.search(r"Model-predicted DE vs mRNA DE.*?Fisher exact: OR = ([0-9.]+), p = ([0-9.eE+-]+)",
+                                   ortho_text, re.DOTALL)
         if rho_m:
             lines.append(f"### RNA-Protein Correlation")
             lines.append(f"- Spearman rho: {rho_m.group(1)}")
@@ -599,9 +705,13 @@ def generate_publication_summary(all_metrics, dataset, config):
                 lines.append(f"- Matched genes: {matched_m.group(1)}")
             if fisher_m:
                 lines.append(f"- Fisher exact OR (protein-DE vs mRNA-DE): {fisher_m.group(1)}")
+            if model_fisher_m:
+                lines.append(f"- Fisher exact OR (model-predicted DE vs mRNA-DE): {model_fisher_m.group(1)}")
             lines.append("")
         if sig_terms_m:
             lines.append(f"### Pathway Enrichment")
+            if de_pred_m:
+                lines.append(f"- Predicted DE proteins: {de_pred_m.group(1)} / {de_pred_m.group(2)}")
             lines.append(f"- Significant terms (FDR < 0.05): {sig_terms_m.group(1)}")
             lines.append("")
     else:

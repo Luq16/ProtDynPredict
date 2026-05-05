@@ -12,8 +12,8 @@ Validation sections:
 
 Input:  data/processed/feature_matrix_train.csv
         data/raw/de_results.csv
-        models/stage1_model.joblib, models/stage2_model.joblib
-        results/cv_predictions_stage1.npz, results/cv_predictions_stage2.npz
+        models/stage1_model.joblib, models/stage2[_improved]_model.joblib
+        results/cv_predictions_stage1.npz, results/cv_predictions_stage2[_improved].npz
 Output: results/figures/permutation_test.png
         results/figures/bootstrap_ci.png
         results/figures/threshold_sensitivity.png
@@ -106,6 +106,13 @@ def _cv_auc(X, y, params, n_folds, seed):
     return np.mean(aucs)
 
 
+def _preferred_stage2_predictions_path(cfg):
+    """Prefer improved Stage 2 CV predictions when present."""
+    improved = Path(cfg["results_dir"]) / "cv_predictions_stage2_improved.npz"
+    original = Path(cfg["results_dir"]) / "cv_predictions_stage2.npz"
+    return improved if improved.exists() else original
+
+
 # ---------------------------------------------------------------------------
 # Section 1: Permutation Test
 # ---------------------------------------------------------------------------
@@ -174,7 +181,10 @@ def bootstrap_ci(cfg):
 
     results = {}
     for stage, label in [("stage1", "Stage 1"), ("stage2", "Stage 2")]:
-        npz_path = Path(cfg["results_dir"]) / f"cv_predictions_{stage}.npz"
+        if stage == "stage2":
+            npz_path = _preferred_stage2_predictions_path(cfg)
+        else:
+            npz_path = Path(cfg["results_dir"]) / f"cv_predictions_{stage}.npz"
         if not npz_path.exists():
             print(f"  {label}: {npz_path} not found, skipping.")
             continue

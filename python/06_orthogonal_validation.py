@@ -37,6 +37,11 @@ warnings.filterwarnings("ignore")
 CONFIG = {
     "train_file": "data/ucec/processed/feature_matrix_train.csv",
     "de_file": "data/ucec/raw/de_results.csv",
+    "expr_file": "data/ucec/raw/expr_matrix.csv",
+    "sample_labels_file": "data/ucec/raw/sample_labels.csv",
+    "rna_cache_file": "data/ucec/processed/rna_de_results.csv",
+    "gene_map_cache_file": "data/ucec/processed/uniprot_gene_mapping.csv",
+    "human_proteome_tsv": "data/human_proteome/raw/uniprot_human_reviewed.tsv",
     "pathway_file": "data/processed/pathway_membership.csv",
     "go_slim_file": "data/processed/go_slim_matrix.csv",
     "model_dir": "models",
@@ -88,10 +93,148 @@ def _load_de_results():
     return df
 
 
+def _load_local_protein_gene_de():
+    """Compute gene-level protein DE from the cached local expression matrix."""
+    expr_path = Path(CONFIG["expr_file"])
+    labels_path = Path(CONFIG["sample_labels_file"])
+    if not expr_path.exists() or not labels_path.exists():
+        raise FileNotFoundError("Local expr_matrix.csv / sample_labels.csv not found")
+
+    expr_df = pd.read_csv(expr_path)
+    labels_df = pd.read_csv(labels_path)
+    if "Patient_ID" not in expr_df.columns:
+        raise ValueError("expr_matrix.csv missing Patient_ID column")
+
+    expr_df = expr_df.set_index("Patient_ID")
+    sample_labels = labels_df.set_index("Patient_ID")["group"]
+    common = expr_df.index.intersection(sample_labels.index)
+    expr_df = expr_df.loc[common]
+    sample_labels = sample_labels.loc[common]
+
+    tumor_mask = sample_labels == "Tumor"
+    normal_mask = sample_labels == "Normal"
+    if normal_mask.sum() < 3:
+        raise ValueError("Fewer than 3 normal samples in local proteomics matrix")
+
+    results = []
+    for gene in expr_df.columns:
+        vals = expr_df[gene]
+        t_vals = vals[tumor_mask].dropna()
+        n_vals = vals[normal_mask].dropna()
+        if len(t_vals) < 3 or len(n_vals) < 3:
+            continue
+        log2fc = t_vals.mean() - n_vals.mean()
+        _, p_val = stats.ttest_ind(t_vals, n_vals, equal_var=False)
+        if np.isnan(log2fc) or np.isnan(p_val):
+            continue
+        results.append({
+            "gene_symbol": gene,
+            "log2FC": log2fc,
+            "pvalue": p_val,
+        })
+
+    prot_de = pd.DataFrame(results)
+    if prot_de.empty:
+        raise ValueError("No gene-level proteomics DE results computed")
+
+    from statsmodels.stats.multitest import multipletests
+    _, adj_p, _, _ = multipletests(prot_de["pvalue"], method="fdr_bh")
+    prot_de["adj_pvalue"] = adj_p
+    log.info(f"  Local proteomics DE computed for {len(prot_de)} genes")
+    return prot_de[["gene_symbol", "log2FC", "adj_pvalue"]]
+
+
+def _load_or_compute_rna_de():
+    """Load cached RNA DE results or compute them from CPTAC transcriptomics."""
+    cache_path = Path(CONFIG["rna_cache_file"])
+    if cache_path.exists():
+        rna_de = pd.read_csv(cache_path)
+        log.info(f"  Loaded cached RNA DE results: {len(rna_de)} genes")
+        return rna_de
+
+    # Monkey-patch pyranges before importing cptac
+    pyranges_mock = types.ModuleType("pyranges")
+    pyranges_mock.read_gtf = lambda *a, **k: None
+    sys.modules["pyranges"] = pyranges_mock
+
+    import cptac
+
+    log.info("  Loading CPTAC UCEC transcriptomics...")
+    dataset = cptac.Ucec()
+
+    rna_raw = None
+    sources = ["bcm", "broad", "washu", "umich", "harmonized"]
+    for src in sources:
+        try:
+            rna_raw = dataset.get_transcriptomics(source=src)
+            log.info(f"  Loaded transcriptomics from source='{src}'")
+            break
+        except Exception as exc:
+            log.info(f"  Transcriptomics source '{src}' unavailable: {type(exc).__name__}")
+            continue
+    if rna_raw is None:
+        raise ValueError("Could not extract transcriptomics data from CPTAC")
+
+    if isinstance(rna_raw.columns, pd.MultiIndex):
+        rna_df = rna_raw.copy()
+        rna_df.columns = rna_raw.columns.get_level_values(0)
+    else:
+        rna_df = rna_raw.copy()
+
+    rna_df = rna_df.T.groupby(level=0).mean().T
+    log.info(f"  Transcriptomics matrix: {rna_df.shape[0]} samples x {rna_df.shape[1]} genes")
+
+    sample_type = pd.Series(
+        ["Normal" if str(sid).endswith(".N") or "Normal" in str(sid) else "Tumor"
+         for sid in rna_df.index],
+        index=rna_df.index,
+    )
+    tumor_mask = sample_type == "Tumor"
+    normal_mask = sample_type == "Normal"
+    log.info(f"  Tumor: {tumor_mask.sum()}, Normal: {normal_mask.sum()}")
+    if normal_mask.sum() < 3:
+        raise ValueError("Fewer than 3 normal samples in transcriptomics")
+
+    results = []
+    for gene in rna_df.columns:
+        vals = rna_df[gene]
+        t_vals = vals[tumor_mask].dropna()
+        n_vals = vals[normal_mask].dropna()
+        if len(t_vals) < 3 or len(n_vals) < 3:
+            continue
+        rna_log2fc = t_vals.mean() - n_vals.mean()
+        _, p_val = stats.ttest_ind(t_vals, n_vals, equal_var=False)
+        if np.isnan(rna_log2fc) or np.isnan(p_val):
+            continue
+        results.append({
+            "gene_symbol": gene,
+            "rna_log2FC": rna_log2fc,
+            "rna_pvalue": p_val,
+        })
+
+    rna_de = pd.DataFrame(results)
+    if rna_de.empty:
+        raise ValueError("No RNA DE results computed")
+
+    from statsmodels.stats.multitest import multipletests
+    _, adj_p, _, _ = multipletests(rna_de["rna_pvalue"], method="fdr_bh")
+    rna_de["rna_adj_pvalue"] = adj_p
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    rna_de.to_csv(cache_path, index=False)
+    log.info(f"  Cached RNA DE results to {cache_path}")
+    return rna_de
+
+
 def _load_model(stage="stage1"):
     """Load a saved model artifact."""
     import joblib
-    path = Path(CONFIG["model_dir"]) / f"{stage}_model.joblib"
+    if stage == "stage1":
+        improved = Path(CONFIG["model_dir"]) / "stage1_improved_model.joblib"
+        original = Path(CONFIG["model_dir"]) / "stage1_model.joblib"
+        path = improved if improved.exists() else original
+    else:
+        path = Path(CONFIG["model_dir"]) / f"{stage}_model.joblib"
     if not path.exists():
         raise FileNotFoundError(f"Model not found: {path}")
     artifact = joblib.load(path)
@@ -99,44 +242,99 @@ def _load_model(stage="stage1"):
     return artifact
 
 
-def _build_uniprot_to_gene_map():
-    """Build UniProt_ID -> gene_symbol mapping via UniProt REST API.
+def _build_stage1_matrix(df: pd.DataFrame, artifact: dict):
+    """Construct the feature matrix expected by the saved Stage 1 artifact."""
+    feature_type = artifact.get("feature_type", "full")
 
-    Falls back to cptac proteomics column names if API is unavailable.
-    """
-    de = _load_de_results()
-    uniprots = de["UniProt_ID"].unique().tolist()
+    if feature_type == "non-sequence":
+        feature_cols = artifact.get("feature_cols") or artifact.get("nonseq_cols", [])
+        X = df[feature_cols].values.astype(np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if feature_type == "pca":
+        seq_cols = artifact["seq_cols"]
+        nonseq_cols = artifact["nonseq_cols"]
+        X_seq = df[seq_cols].values.astype(np.float32)
+        X_nonseq = df[nonseq_cols].values.astype(np.float32)
+        X_seq = np.nan_to_num(X_seq, nan=0.0, posinf=0.0, neginf=0.0)
+        X_nonseq = np.nan_to_num(X_nonseq, nan=0.0, posinf=0.0, neginf=0.0)
+        X_pca = artifact["pca"].transform(artifact["scaler"].transform(X_seq))
+        return np.hstack([X_pca, X_nonseq])
+
+    feature_cols = artifact["feature_cols"]
+    X = df[feature_cols].values.astype(np.float32)
+    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _build_uniprot_to_gene_map(uniprots=None):
+    """Build UniProt_ID -> gene_symbol mapping from local reference, cache subset."""
+    if uniprots is None:
+        train_df = _load_training_data()
+        uniprots = train_df["UniProt_ID"].dropna().unique().tolist()
+    else:
+        uniprots = list(pd.unique(pd.Series(uniprots).dropna()))
+
+    cache_path = Path(CONFIG["gene_map_cache_file"])
+    if cache_path.exists():
+        cache_df = pd.read_csv(cache_path)
+        if {"UniProt_ID", "gene_symbol"}.issubset(cache_df.columns):
+            cached = dict(zip(cache_df["UniProt_ID"], cache_df["gene_symbol"]))
+            if set(uniprots).issubset(set(cached)):
+                log.info(f"  Loaded cached UniProt->gene map: {len(cached)} entries")
+                return cached
 
     gene_map = {}
-    try:
-        import requests
-        log.info("  Querying UniProt REST API for gene symbol mapping...")
-        batch_size = 100
-        for i in range(0, len(uniprots), batch_size):
-            batch = uniprots[i:i + batch_size]
-            query = " OR ".join([f"(accession:{uid})" for uid in batch])
-            resp = requests.get(
-                "https://rest.uniprot.org/uniprotkb/search",
-                params={
-                    "query": f"({query}) AND (organism_id:9606)",
-                    "fields": "accession,gene_primary",
-                    "format": "tsv",
-                    "size": "500",
-                },
-                timeout=30,
+    ref_path = Path(CONFIG["human_proteome_tsv"])
+    if ref_path.exists():
+        ref_df = pd.read_csv(ref_path, sep="\t")
+        acc_col = next((c for c in ref_df.columns if c.lower() in ("entry", "accession")), None)
+        gene_col = next((c for c in ref_df.columns if "gene" in c.lower() and "primary" in c.lower()), None)
+        if acc_col and gene_col:
+            ref_df = ref_df[[acc_col, gene_col]].dropna()
+            ref_df.columns = ["UniProt_ID", "gene_symbol"]
+            ref_df["gene_symbol"] = ref_df["gene_symbol"].astype(str).str.split().str[0]
+            ref_df = ref_df.drop_duplicates("UniProt_ID")
+            gene_map.update(
+                dict(zip(ref_df["UniProt_ID"], ref_df["gene_symbol"]))
             )
-            if resp.status_code == 200:
-                for line in resp.text.strip().split("\n")[1:]:
-                    parts = line.split("\t")
-                    if len(parts) >= 2:
-                        uid, gene = parts[0], parts[1]
-                        if uid in batch and uid not in gene_map:
-                            gene_map[uid] = gene
-        log.info(f"  Mapped {len(gene_map)}/{len(uniprots)} IDs to gene symbols")
-    except Exception as e:
-        log.warning(f"  UniProt API mapping failed: {e}")
+            log.info(f"  Loaded local UniProt reference mapping: {len(gene_map)} entries")
 
-    return gene_map
+    missing = [uid for uid in uniprots if uid not in gene_map]
+    if missing:
+        try:
+            import requests
+            log.info(f"  Querying UniProt REST API for {len(missing)} missing IDs...")
+            batch_size = 100
+            for i in range(0, len(missing), batch_size):
+                batch = missing[i:i + batch_size]
+                query = " OR ".join([f"(accession:{uid})" for uid in batch])
+                resp = requests.get(
+                    "https://rest.uniprot.org/uniprotkb/search",
+                    params={
+                        "query": f"({query}) AND (organism_id:9606)",
+                        "fields": "accession,gene_primary",
+                        "format": "tsv",
+                        "size": "500",
+                    },
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    for line in resp.text.strip().split("\n")[1:]:
+                        parts = line.split("\t")
+                        if len(parts) >= 2:
+                            uid, gene = parts[0], parts[1]
+                            if uid in batch and gene:
+                                gene_map[uid] = gene
+        except Exception as e:
+            log.warning(f"  UniProt API mapping failed: {e}")
+
+    subset = {uid: gene_map[uid] for uid in uniprots if uid in gene_map}
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [{"UniProt_ID": uid, "gene_symbol": gene} for uid, gene in subset.items()]
+    ).to_csv(cache_path, index=False)
+    log.info(f"  Cached UniProt->gene map: {len(subset)}/{len(uniprots)} IDs")
+    return subset
 
 
 # =========================================================================
@@ -150,100 +348,8 @@ def rna_protein_correlation(report_sections: list):
     log.info("=" * 60)
 
     try:
-        # Monkey-patch pyranges before importing cptac
-        pyranges_mock = types.ModuleType("pyranges")
-        pyranges_mock.read_gtf = lambda *a, **k: None
-        sys.modules["pyranges"] = pyranges_mock
-
-        import cptac
-    except ImportError:
-        msg = ("cptac package not available. Skipping RNA-protein "
-               "correlation analysis.\n\nInstall with: `pip install cptac`")
-        log.warning(f"  {msg}")
-        report_sections.append(f"{section_title}\n\n{msg}\n")
-        return
-
-    try:
-        # Load dataset
-        log.info("  Loading CPTAC UCEC dataset...")
-        dataset = cptac.Ucec()
-
-        # --- Proteomics (reuse DE results for protein log2FC) ---
-        de_df = _load_de_results()
-
-        # --- Transcriptomics ---
-        log.info("  Extracting transcriptomics data...")
-        # cptac may have a bug with generator in get_transcriptomics;
-        # try specific sources to avoid the len(generator) bug
-        rna_raw = None
-        for src in ['bcm', 'broad', 'washu', 'umich', 'harmonized']:
-            try:
-                rna_raw = dataset.get_transcriptomics(source=src)
-                log.info(f"  Loaded transcriptomics from source='{src}'")
-                break
-            except Exception:
-                continue
-        if rna_raw is None:
-            raise ValueError("Could not extract transcriptomics data from CPTAC")
-        if isinstance(rna_raw.columns, pd.MultiIndex):
-            rna_df = rna_raw.copy()
-            rna_df.columns = rna_raw.columns.get_level_values(0)
-        else:
-            rna_df = rna_raw.copy()
-
-        # Merge duplicate gene columns
-        rna_df = rna_df.T.groupby(level=0).mean().T
-        log.info(f"  Transcriptomics matrix: {rna_df.shape[0]} samples x "
-                 f"{rna_df.shape[1]} genes")
-
-        # Identify tumor vs normal
-        sample_ids = rna_df.index.tolist()
-        sample_type = np.array([
-            "Normal" if str(sid).endswith(".N") or "Normal" in str(sid)
-            else "Tumor"
-            for sid in sample_ids
-        ])
-        tumor_mask = sample_type == "Tumor"
-        normal_mask = sample_type == "Normal"
-        log.info(f"  Tumor: {tumor_mask.sum()}, Normal: {normal_mask.sum()}")
-
-        if normal_mask.sum() < 3:
-            raise ValueError("Fewer than 3 normal samples in transcriptomics")
-
-        # Compute mRNA log2FC per gene (same approach as proteomics)
-        log.info("  Computing mRNA log2FC (tumor vs normal)...")
-        rna_results = []
-        for gene in rna_df.columns:
-            vals = rna_df[gene]
-            t_vals = vals[tumor_mask].dropna()
-            n_vals = vals[normal_mask].dropna()
-            if len(t_vals) < 3 or len(n_vals) < 3:
-                continue
-            rna_log2fc = t_vals.mean() - n_vals.mean()
-            _, p_val = stats.ttest_ind(t_vals, n_vals, equal_var=False)
-            if np.isnan(rna_log2fc) or np.isnan(p_val):
-                continue
-            rna_results.append({
-                "gene_symbol": gene,
-                "rna_log2FC": rna_log2fc,
-                "rna_pvalue": p_val,
-            })
-
-        rna_de = pd.DataFrame(rna_results)
-        log.info(f"  mRNA DE computed for {len(rna_de)} genes")
-
-        # BH correction
-        if len(rna_de) > 0:
-            from statsmodels.stats.multitest import multipletests
-            _, adj_p, _, _ = multipletests(rna_de["rna_pvalue"], method="fdr_bh")
-            rna_de["rna_adj_pvalue"] = adj_p
-        else:
-            raise ValueError("No mRNA DE results computed")
-
-        # Map UniProt IDs to gene symbols for matching
-        gene_map = _build_uniprot_to_gene_map()
-        de_df["gene_symbol"] = de_df["UniProt_ID"].map(gene_map)
-        de_df = de_df.dropna(subset=["gene_symbol"])
+        de_df = _load_local_protein_gene_de()
+        rna_de = _load_or_compute_rna_de()
 
         # Merge protein and RNA data on gene symbol
         merged = de_df.merge(rna_de, on="gene_symbol", how="inner")
@@ -274,17 +380,21 @@ def rna_protein_correlation(report_sections: list):
         log.info(f"  Fisher exact: OR = {fisher_or:.2f}, p = {fisher_p:.2e}")
         log.info(f"  Concordance table: [[{a},{b}],[{c},{d}]]")
 
-        # --- Model prediction vs mRNA DE ---
         model_vs_rna_text = ""
         try:
             train_df = _load_training_data()
+            gene_map = _build_uniprot_to_gene_map(train_df["UniProt_ID"].unique())
             train_df["gene_symbol"] = train_df["UniProt_ID"].map(gene_map)
-            train_labels = train_df[["gene_symbol", "label"]].dropna(
-                subset=["gene_symbol"]
-            )
-            merged2 = merged.merge(train_labels, on="gene_symbol", how="inner")
+            stage1_artifact = _load_model("stage1")
+            X_model = _build_stage1_matrix(train_df, stage1_artifact)
+            pred_de_proba = stage1_artifact["model"].predict_proba(X_model)[:, 1]
+            train_preds = train_df[["gene_symbol"]].copy()
+            train_preds["pred_de_label"] = pred_de_proba >= 0.5
+            train_preds = train_preds.dropna(subset=["gene_symbol"]).drop_duplicates("gene_symbol")
+
+            merged2 = merged.merge(train_preds, on="gene_symbol", how="inner")
             if len(merged2) > 10:
-                pred_de = merged2["label"] != "unchanged"
+                pred_de = merged2["pred_de_label"]
                 rna_de_flag = ((merged2["rna_log2FC"].abs() > thresh) &
                                (merged2["rna_adj_pvalue"] < fdr))
                 a2 = (pred_de & rna_de_flag).sum()
@@ -307,15 +417,12 @@ def rna_protein_correlation(report_sections: list):
         # --- Plot ---
         fig, ax = plt.subplots(figsize=(7, 6))
 
-        # Color by training label if available
+        # Color by observed proteomics DE label
         colors = np.full(len(merged), "#888888")
         try:
-            train_df = _load_training_data()
-            train_df["gene_symbol"] = train_df["UniProt_ID"].map(gene_map)
-            label_map = dict(zip(train_df["gene_symbol"], train_df["label"]))
-            merged["pred_class"] = merged["gene_symbol"].map(label_map)
-            color_dict = {"up": "#e74c3c", "down": "#3498db",
-                          "unchanged": "#95a5a6"}
+            merged["pred_class"] = ((merged["log2FC"].abs() > thresh) &
+                                    (merged["adj_pvalue"] < fdr))
+            color_dict = {True: "#e74c3c", False: "#95a5a6"}
             colors = merged["pred_class"].map(color_dict).fillna("#888888").values
         except Exception:
             pass
@@ -338,11 +445,9 @@ def rna_protein_correlation(report_sections: list):
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0], [0], marker="o", color="w", markerfacecolor="#e74c3c",
-                   label="Up", markersize=7),
-            Line2D([0], [0], marker="o", color="w", markerfacecolor="#3498db",
-                   label="Down", markersize=7),
+                   label="Observed protein DE", markersize=7),
             Line2D([0], [0], marker="o", color="w", markerfacecolor="#95a5a6",
-                   label="Unchanged", markersize=7),
+                   label="Observed protein not-DE", markersize=7),
         ]
         ax.legend(handles=legend_elements, loc="upper left", framealpha=0.8)
         ax.axhline(0, color="grey", lw=0.5, ls=":")
@@ -393,10 +498,11 @@ def pathway_enrichment(report_sections: list):
     try:
         train_df = _load_training_data()
 
-        # Identify predicted-DE proteins (from training labels)
-        de_proteins = set(
-            train_df.loc[train_df["label"] != "unchanged", "UniProt_ID"]
-        )
+        # Identify predicted-DE proteins from the trained Stage 1 model.
+        stage1_artifact = _load_model("stage1")
+        X_model = _build_stage1_matrix(train_df, stage1_artifact)
+        pred_de_proba = stage1_artifact["model"].predict_proba(X_model)[:, 1]
+        de_proteins = set(train_df.loc[pred_de_proba >= 0.5, "UniProt_ID"])
         all_proteins = set(train_df["UniProt_ID"])
         log.info(f"  DE proteins: {len(de_proteins)}/{len(all_proteins)}")
 

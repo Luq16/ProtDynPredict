@@ -4,10 +4,9 @@
 Improved ProtDynPredict model via PCA dimensionality reduction on sequence
 features, alternative classifiers, and Platt calibration.
 
-Motivation: Feature ablation (04b) showed removing 999 sequence features
-*improves* AUC by +0.025, while GO-slim features carry the dominant signal.
-This script systematically compares model variants to identify the best
-feature configuration.
+Motivation: feature ablation showed the large sequence-descriptor block can
+hurt net performance. This script systematically compares model variants to
+identify the best feature configuration for either stage.
 
 Variants compared (all use same default XGBoost params for fair comparison):
   A) PCA-reduced sequence + all non-sequence features (XGBoost)
@@ -26,11 +25,7 @@ Methodological safeguards:
   - Holm-Bonferroni correction for multiple model comparisons
 
 Input:  data/<dataset>/processed/feature_matrix_train.csv
-Output: results/<dataset>/figures/pca_variance.png
-        results/<dataset>/figures/model_comparison.png
-        results/<dataset>/figures/calibration_improved.png
-        results/<dataset>/reports/model_improvement_report.md
-        models/<dataset>/stage1_improved_model.joblib
+Output: stage-specific figures, reports, and improved model artifacts
 """
 
 import argparse
@@ -174,7 +169,7 @@ def holm_bonferroni(p_values):
 
 # ── Data Loading ──────────────────────────────────────────────────────────
 
-def load_data(data_path):
+def load_data(data_path, stage=1):
     """Load and split features into sequence / non-sequence."""
     df = pd.read_csv(data_path)
     all_features = _safe_feature_cols(df.columns)
@@ -191,14 +186,25 @@ def load_data(data_path):
     X_nonseq = df[nonseq_cols].values.astype(np.float32)
     X_nonseq = np.nan_to_num(X_nonseq, nan=0.0, posinf=0.0, neginf=0.0)
 
-    y = np.where(df["label"] == "unchanged", 0, 1)
+    if stage == 1:
+        y = np.where(df["label"] == "unchanged", 0, 1)
+        label_summary = f"DE: {np.sum(y==1)} | Unchanged: {np.sum(y==0)}"
+        stage_label = "Stage 1 (DE vs Unchanged)"
+    else:
+        de_mask = df["label"].isin(["up", "down"]).values
+        X_all = X_all[de_mask]
+        X_seq = X_seq[de_mask]
+        X_nonseq = X_nonseq[de_mask]
+        y = np.where(df.loc[de_mask, "label"] == "up", 1, 0)
+        label_summary = f"Up: {np.sum(y==1)} | Down: {np.sum(y==0)}"
+        stage_label = "Stage 2 (Up vs Down)"
 
     print(f"  Proteins: {len(y)} | Total safe features: {len(all_features)}")
     print(f"  Sequence features: {len(seq_cols)}")
     print(f"  Non-sequence features: {len(nonseq_cols)}")
-    print(f"  DE: {np.sum(y==1)} | Unchanged: {np.sum(y==0)}")
+    print(f"  {label_summary}")
 
-    return X_all, X_seq, X_nonseq, y, all_features, seq_cols, nonseq_cols
+    return X_all, X_seq, X_nonseq, y, all_features, seq_cols, nonseq_cols, stage_label
 
 
 # ── PCA (for variance plot only — actual PCA done per-fold) ──────────────
@@ -460,7 +466,8 @@ def optimize_xgb(X, y, splits, n_trials, seed, name, X_seq=None,
 
 # ── Platt Calibration ────────────────────────────────────────────────────
 
-def calibrate_and_evaluate(X, y, params, splits, name):
+def calibrate_and_evaluate(X, y, params, splits, name, X_seq=None,
+                            X_nonseq=None, pca_variance=0.95, use_pca=False):
     """Platt calibration: train base on full training fold, fit sigmoid
     on a nested held-out portion, evaluate on true validation fold.
 
@@ -474,27 +481,39 @@ def calibrate_and_evaluate(X, y, params, splits, name):
     all_y_pred = []
 
     for fold, (train_idx, val_idx) in enumerate(splits):
+        if use_pca and X_seq is not None and X_nonseq is not None:
+            scaler = StandardScaler()
+            X_seq_train_sc = scaler.fit_transform(X_seq[train_idx])
+            X_seq_val_sc = scaler.transform(X_seq[val_idx])
+
+            pca = PCA(n_components=pca_variance, random_state=RANDOM_STATE)
+            X_train = np.hstack([pca.fit_transform(X_seq_train_sc), X_nonseq[train_idx]])
+            X_val = np.hstack([pca.transform(X_seq_val_sc), X_nonseq[val_idx]])
+        else:
+            X_train = X[train_idx]
+            X_val = X[val_idx]
+
         # Train base model on full training fold (no early stopping for
         # calibration to avoid needing yet another split)
         base_params = {k: v for k, v in params.items()
                        if k != "early_stopping_rounds"}
         base_clf = xgb.XGBClassifier(**base_params)
-        base_clf.fit(X[train_idx], y[train_idx], verbose=False)
+        base_clf.fit(X_train, y[train_idx], verbose=False)
 
         # Nested split for Platt fitting
         rng = np.random.RandomState(RANDOM_STATE + fold + 100)
         n_train = len(train_idx)
         perm = rng.permutation(n_train)
         n_cal = max(int(n_train * 0.2), 50)
-        cal_idx = train_idx[perm[:n_cal]]
+        cal_rows = perm[:n_cal]
 
         # Fit Platt sigmoid on calibration subset's predictions
-        cal_proba = base_clf.predict_proba(X[cal_idx])[:, 1].reshape(-1, 1)
+        cal_proba = base_clf.predict_proba(X_train[cal_rows])[:, 1].reshape(-1, 1)
         platt = _LR(max_iter=1000)
-        platt.fit(cal_proba, y[cal_idx])
+        platt.fit(cal_proba, y[train_idx][cal_rows])
 
         # Evaluate on validation fold
-        y_proba_uncal = base_clf.predict_proba(X[val_idx])[:, 1]
+        y_proba_uncal = base_clf.predict_proba(X_val)[:, 1]
         y_proba_cal = platt.predict_proba(y_proba_uncal.reshape(-1, 1))[:, 1]
         y_pred = (y_proba_cal >= 0.5).astype(int)
 
@@ -543,7 +562,7 @@ def calibrate_and_evaluate(X, y, params, splits, name):
 
 # ── Plotting ──────────────────────────────────────────────────────────────
 
-def plot_pca_variance(cumvar, n_components, fig_dir):
+def plot_pca_variance(cumvar, n_components, output_path):
     """Plot cumulative explained variance from PCA."""
     fig, ax = plt.subplots(figsize=(7, 4.5))
     x = np.arange(1, len(cumvar) + 1)
@@ -560,11 +579,11 @@ def plot_pca_variance(cumvar, n_components, fig_dir):
     ax.set_xlim(1, min(200, len(cumvar)))
     ax.set_ylim(0, 1.02)
     plt.tight_layout()
-    plt.savefig(fig_dir / "pca_variance.png", dpi=150, bbox_inches="tight")
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def plot_model_comparison(all_results, fig_dir):
+def plot_model_comparison(all_results, output_path):
     """Bar chart comparing model variants."""
     names = [r["name"] for r in all_results]
     aucs = [r["overall_auc"] for r in all_results]
@@ -595,11 +614,11 @@ def plot_model_comparison(all_results, fig_dir):
         ax2.text(i, b + 0.003, f"{b:.4f}", ha="center", va="bottom", fontsize=8)
 
     plt.tight_layout()
-    plt.savefig(fig_dir / "model_comparison.png", dpi=150, bbox_inches="tight")
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def plot_calibration_comparison(uncal_result, cal_result, fig_dir):
+def plot_calibration_comparison(uncal_result, cal_result, output_path):
     """Plot calibration curves: uncalibrated vs calibrated."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -625,17 +644,18 @@ def plot_calibration_comparison(uncal_result, cal_result, fig_dir):
         ax.set_ylim(-0.02, 1.02)
 
     plt.tight_layout()
-    plt.savefig(fig_dir / "calibration_improved.png", dpi=150, bbox_inches="tight")
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
 # ── Report Generation ─────────────────────────────────────────────────────
 
 def generate_report(all_results, baseline_result, pca_info, cal_result,
-                     best_tuned_result, rpt_dir):
+                     best_tuned_result, report_path, stage_label,
+                     pca_plot_name, calibration_plot_name):
     """Generate markdown comparison report."""
     lines = []
-    lines.append("# Model Improvement Report\n")
+    lines.append(f"# Model Improvement Report - {stage_label}\n")
     lines.append(f"**Date**: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}\n")
     lines.append("---\n")
 
@@ -653,28 +673,7 @@ def generate_report(all_results, baseline_result, pca_info, cal_result,
     lines.append(f"- **Original sequence features**: {pca_info['n_original']}")
     lines.append(f"- **PCA components (95% var)**: {pca_info['n_components']}")
     lines.append(f"- **Compression ratio**: {pca_info['n_original'] / pca_info['n_components']:.1f}x\n")
-    lines.append("![PCA Variance](../figures/pca_variance.png)\n")
-
-    # Model comparison table
-    lines.append("## 2. Model Comparison (Default Params)\n")
-    lines.append("| Model | AUC | AUC (mean+/-std) | F1 | MCC | Brier | vs Baseline |")
-    lines.append("|-------|-----|------------------|----|-----|-------|-------------|")
-
-    baseline_auc = baseline_result["overall_auc"]
-    for r in all_results:
-        delta = r["overall_auc"] - baseline_auc
-        lines.append(
-            f"| {r['name']} | {r['overall_auc']:.4f} | "
-            f"{r['mean_auc']:.4f}+/-{r['std_auc']:.4f} | "
-            f"{r['overall_f1']:.3f} | {r['overall_mcc']:.3f} | "
-            f"{r['brier']:.4f} | {delta:+.4f} |"
-        )
-    lines.append("")
-
-    # Paired t-tests with Holm-Bonferroni
-    lines.append("## 3. Statistical Significance (Holm-Bonferroni corrected)\n")
-    lines.append("| Model | t-stat | Raw p | Adjusted p | Significant? |")
-    lines.append("|-------|--------|-------|------------|-------------|")
+    lines.append(f"![PCA Variance](../figures/{pca_plot_name})\n")
 
     non_baseline = [r for r in all_results if r["name"] != baseline_result["name"]]
     raw_pvals = []
@@ -683,8 +682,32 @@ def generate_report(all_results, baseline_result, pca_info, cal_result,
         t_stat, p_val = ttest_rel(baseline_result["fold_aucs"], r["fold_aucs"])
         raw_pvals.append(p_val)
         t_stats.append(t_stat)
-
     adj_pvals = holm_bonferroni(np.array(raw_pvals))
+    adj_p_by_name = {
+        r["name"]: adj_p for r, adj_p in zip(non_baseline, adj_pvals)
+    }
+
+    # Model comparison table
+    lines.append("## 2. Model Comparison (Default Params)\n")
+    lines.append("| Model | AUC | AUC (mean+/-std) | F1 | MCC | Brier | vs Baseline | Adj p vs Baseline |")
+    lines.append("|-------|-----|------------------|----|-----|-------|-------------|-------------------|")
+
+    baseline_auc = baseline_result["overall_auc"]
+    for r in all_results:
+        delta = r["overall_auc"] - baseline_auc
+        adj_p_str = "—" if r["name"] == baseline_result["name"] else f"{adj_p_by_name[r['name']]:.4f}"
+        lines.append(
+            f"| {r['name']} | {r['overall_auc']:.4f} | "
+            f"{r['mean_auc']:.4f}+/-{r['std_auc']:.4f} | "
+            f"{r['overall_f1']:.3f} | {r['overall_mcc']:.3f} | "
+            f"{r['brier']:.4f} | {delta:+.4f} | {adj_p_str} |"
+        )
+    lines.append("")
+
+    # Paired t-tests with Holm-Bonferroni
+    lines.append("## 3. Statistical Significance (Holm-Bonferroni corrected)\n")
+    lines.append("| Model | t-stat | Raw p | Adjusted p | Significant? |")
+    lines.append("|-------|--------|-------|------------|-------------|")
 
     for r, t_stat, raw_p, adj_p in zip(non_baseline, t_stats, raw_pvals, adj_pvals):
         sig = "Yes" if adj_p < 0.05 else "No"
@@ -712,7 +735,7 @@ def generate_report(all_results, baseline_result, pca_info, cal_result,
         improvement = cal_result['brier_uncalibrated'] - cal_result['brier']
         lines.append(f"- **Improvement**: {improvement:+.4f}")
         lines.append("- Note: Base model trained on full training fold (AUC comparable to uncalibrated)\n")
-        lines.append("![Calibration](../figures/calibration_improved.png)\n")
+        lines.append(f"![Calibration](../figures/{calibration_plot_name})\n")
 
     # Recommendation
     lines.append("## 6. Recommendation\n")
@@ -723,7 +746,6 @@ def generate_report(all_results, baseline_result, pca_info, cal_result,
     lines.append("---\n")
     lines.append("*Generated by `13_improved_model.py`*\n")
 
-    report_path = rpt_dir / "model_improvement_report.md"
     with open(report_path, "w") as f:
         f.write("\n".join(lines))
     print(f"\n  Report saved: {report_path}")
@@ -737,12 +759,14 @@ def main():
         description="Improved model via PCA + calibration + alternatives"
     )
     parser.add_argument("--dataset", default="ucec")
+    parser.add_argument("--stage", type=int, choices=[1, 2], default=1)
     parser.add_argument("--optuna-trials", type=int, default=50)
     parser.add_argument("--pca-variance", type=float, default=0.95,
                         help="Cumulative variance threshold for PCA (default: 0.95)")
     args = parser.parse_args()
 
     dataset = args.dataset
+    stage = args.stage
     n_trials = args.optuna_trials
     pca_var = args.pca_variance
 
@@ -754,13 +778,41 @@ def main():
     for d in [fig_dir, rpt_dir, model_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
+    if stage == 1:
+        stage_label = "Stage 1 (DE vs Unchanged)"
+        stage_slug = ""
+        pca_plot_name = "pca_variance.png"
+        model_plot_name = "model_comparison.png"
+        calibration_plot_name = "calibration_improved.png"
+        report_name = "model_improvement_report.md"
+        improved_model_name = "stage1_improved_model.joblib"
+        cv_pred_name = "cv_predictions_stage1_improved.npz"
+    else:
+        stage_label = "Stage 2 (Up vs Down)"
+        stage_slug = "_stage2"
+        pca_plot_name = "pca_variance_stage2.png"
+        model_plot_name = "model_comparison_stage2.png"
+        calibration_plot_name = "calibration_improved_stage2.png"
+        report_name = "model_improvement_stage2_report.md"
+        improved_model_name = "stage2_improved_model.joblib"
+        cv_pred_name = "cv_predictions_stage2_improved.npz"
+
+    pca_plot_path = fig_dir / pca_plot_name
+    model_plot_path = fig_dir / model_plot_name
+    calibration_plot_path = fig_dir / calibration_plot_name
+    report_path = rpt_dir / report_name
+    improved_model_path = model_dir / improved_model_name
+    cv_pred_path = Path(f"results/{dataset}") / cv_pred_name
+
     print("=" * 60)
-    print(f"  IMPROVED MODEL ANALYSIS [{dataset.upper()}]")
+    print(f"  IMPROVED MODEL ANALYSIS [{dataset.upper()}] - {stage_label}")
     print("=" * 60)
 
     # ── Load data ─────────────────────────────────────────────────────────
     print("\nLoading data...")
-    X_all, X_seq, X_nonseq, y, all_features, seq_cols, nonseq_cols = load_data(data_path)
+    X_all, X_seq, X_nonseq, y, all_features, seq_cols, nonseq_cols, _ = load_data(
+        data_path, stage=stage
+    )
 
     # ── Build protein groups ──────────────────────────────────────────────
     print("\nBuilding protein family groups...")
@@ -777,8 +829,8 @@ def main():
         "n_nonseq": len(nonseq_cols),
     }
 
-    plot_pca_variance(cumvar, n_components, fig_dir)
-    print(f"  PCA variance plot saved to {fig_dir}/pca_variance.png")
+    plot_pca_variance(cumvar, n_components, pca_plot_path)
+    print(f"  PCA variance plot saved to {pca_plot_path}")
 
     # ── Step 2: Fair comparison — all use same default XGBoost params ─────
     print("\n--- Step 2: Model Comparison (Default Params) ---")
@@ -906,6 +958,13 @@ def main():
             X_nonseq, y, default_xgb_params, splits,
             "B-cal: Non-sequence (calibrated)"
         )
+    elif best_uses_pca:
+        cal_result = calibrate_and_evaluate(
+            None, y, default_xgb_params, splits,
+            "A-cal: PCA+XGBoost (calibrated)",
+            X_seq=X_seq, X_nonseq=X_nonseq, pca_variance=pca_var,
+            use_pca=True
+        )
     else:
         cal_result = calibrate_and_evaluate(
             X_all, y, default_xgb_params, splits,
@@ -914,17 +973,18 @@ def main():
     all_results.append(cal_result)
 
     # Plot calibration: best uncalibrated vs calibrated
-    plot_calibration_comparison(best_default, cal_result, fig_dir)
-    print(f"  Calibration plot saved to {fig_dir}/calibration_improved.png")
+    plot_calibration_comparison(best_default, cal_result, calibration_plot_path)
+    print(f"  Calibration plot saved to {calibration_plot_path}")
 
     # ── Step 6: Plots and report ──────────────────────────────────────────
     print("\n--- Step 6: Report Generation ---")
-    plot_model_comparison(all_results, fig_dir)
-    print(f"  Model comparison plot saved to {fig_dir}/model_comparison.png")
+    plot_model_comparison(all_results, model_plot_path)
+    print(f"  Model comparison plot saved to {model_plot_path}")
 
-    report_path = generate_report(
+    generate_report(
         all_results, baseline_result, pca_info, cal_result,
-        best_tuned_result, rpt_dir
+        best_tuned_result, report_path, stage_label,
+        pca_plot_name, calibration_plot_name
     )
 
     # ── Save best model ──────────────────────────────────────────────────
@@ -944,6 +1004,7 @@ def main():
             "model": final_clf,
             "params": save_params,
             "feature_type": "non-sequence",
+            "feature_cols": nonseq_cols,
             "nonseq_cols": nonseq_cols,
             "metrics": {
                 "overall_auc": final_best["overall_auc"],
@@ -1002,13 +1063,28 @@ def main():
             },
         }
 
-    joblib.dump(save_dict, model_dir / "stage1_improved_model.joblib")
-    print(f"  Improved model saved to {model_dir / 'stage1_improved_model.joblib'}")
+    save_dict["stage"] = stage
+    save_dict["stage_label"] = stage_label
+
+    joblib.dump(save_dict, improved_model_path)
+    print(f"  Improved model saved to {improved_model_path}")
+
+    # Save CV predictions for the best variant so downstream analyses can
+    # evaluate model outputs without falling back to training labels.
+    np.savez(
+        cv_pred_path,
+        y_true=final_best["y_true"],
+        y_proba=final_best["y_proba"],
+        y_pred=final_best["y_pred"],
+        fold_aucs=np.array(final_best["fold_aucs"]),
+    )
+    print(f"  Improved CV predictions saved to {cv_pred_path}")
 
     # ── Summary ──────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  IMPROVED MODEL ANALYSIS COMPLETE")
     print("=" * 60)
+    print(f"  {stage_label}")
     print(f"  Baseline AUC:      {baseline_result['overall_auc']:.4f}")
     print(f"  Best model:        {final_best['name']}")
     print(f"  Best AUC:          {final_best['overall_auc']:.4f}")

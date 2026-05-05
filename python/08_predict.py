@@ -9,7 +9,7 @@ Two-stage prediction:
 
 Output includes calibrated confidence scores and biological context.
 
-Input:  models/stage1_model.joblib, models/stage2_model.joblib
+Input:  preferred stage-specific model artifacts from models/<dataset>
         data/processed/feature_matrix_predict.csv
         data/processed/feature_matrix_train.csv (for calibration reference)
 Output: results/predictions.csv
@@ -21,6 +21,46 @@ import numpy as np
 import pandas as pd
 import joblib
 from pathlib import Path
+
+
+def load_preferred_artifact(model_dir: Path, stage: str):
+    improved = model_dir / f"{stage}_improved_model.joblib"
+    original = model_dir / f"{stage}_model.joblib"
+    if improved.exists():
+        return joblib.load(improved)
+    return joblib.load(original)
+
+
+def build_feature_matrix(pred_df: pd.DataFrame, artifact: dict):
+    feature_type = artifact.get("feature_type", "full")
+
+    if feature_type == "non-sequence":
+        feature_cols = artifact.get("feature_cols") or artifact.get("nonseq_cols", [])
+        missing = [c for c in feature_cols if c not in pred_df.columns]
+        for col in missing:
+            pred_df[col] = 0.0
+        X = pred_df[feature_cols].values.astype(np.float32)
+        return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0), feature_cols
+
+    if feature_type == "pca":
+        seq_cols = artifact["seq_cols"]
+        nonseq_cols = artifact["nonseq_cols"]
+        for col in seq_cols + nonseq_cols:
+            if col not in pred_df.columns:
+                pred_df[col] = 0.0
+        X_seq = pred_df[seq_cols].values.astype(np.float32)
+        X_nonseq = pred_df[nonseq_cols].values.astype(np.float32)
+        X_seq = np.nan_to_num(X_seq, nan=0.0, posinf=0.0, neginf=0.0)
+        X_nonseq = np.nan_to_num(X_nonseq, nan=0.0, posinf=0.0, neginf=0.0)
+        X_pca = artifact["pca"].transform(artifact["scaler"].transform(X_seq))
+        return np.hstack([X_pca, X_nonseq]), nonseq_cols
+
+    feature_cols = artifact["feature_cols"]
+    missing = [c for c in feature_cols if c not in pred_df.columns]
+    for col in missing:
+        pred_df[col] = 0.0
+    X = pred_df[feature_cols].values.astype(np.float32)
+    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0), feature_cols
 
 
 def main():
@@ -46,15 +86,16 @@ def main():
 
     # Load models
     model_dir = Path(CONFIG["model_dir"])
-    s1_data = joblib.load(model_dir / "stage1_model.joblib")
+    s1_data = load_preferred_artifact(model_dir, "stage1")
     s1_model = s1_data["model"]
-    feature_cols = s1_data["feature_cols"]
 
-    s2_path = model_dir / "stage2_model.joblib"
     s2_model = None
-    if s2_path.exists():
-        s2_data = joblib.load(s2_path)
-        s2_model = s2_data["model"]
+    s2_data = None
+    for s2_path in [model_dir / "stage2_improved_model.joblib", model_dir / "stage2_model.joblib"]:
+        if s2_path.exists():
+            s2_data = joblib.load(s2_path)
+            s2_model = s2_data["model"]
+            break
 
     # Load prediction data
     pred_df = pd.read_csv(CONFIG["predict_file"])
@@ -68,17 +109,9 @@ def main():
 
     protein_ids = pred_df["UniProt_ID"].values
 
-    # Align features
-    available_features = [c for c in feature_cols if c in pred_df.columns]
-    missing_features = [c for c in feature_cols if c not in pred_df.columns]
-
-    if missing_features:
-        print(f"  Warning: {len(missing_features)} features missing, filling with 0")
-        for f in missing_features:
-            pred_df[f] = 0.0
-
-    X = pred_df[feature_cols].values.astype(np.float32)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X, stage1_context_cols = build_feature_matrix(pred_df, s1_data)
+    print(f"  Stage 1 feature mode: {s1_data.get('feature_type', 'full')}")
+    print(f"  Stage 1 features used: {X.shape[1]}")
 
     # --- Stage 1: DE probability ---
     print("  Stage 1: Predicting DE vs Unchanged...")
@@ -89,8 +122,11 @@ def main():
     de_indices = np.where(de_proba >= CONFIG["de_threshold"])[0]
 
     if s2_model is not None and len(de_indices) > 0:
+        X_s2, _ = build_feature_matrix(pred_df, s2_data)
         print(f"  Stage 2: Predicting Up vs Down for {len(de_indices)} predicted-DE proteins...")
-        up_proba[de_indices] = s2_model.predict_proba(X[de_indices])[:, 1]
+        print(f"  Stage 2 feature mode: {s2_data.get('feature_type', 'full')}")
+        print(f"  Stage 2 features used: {X_s2.shape[1]}")
+        up_proba[de_indices] = s2_model.predict_proba(X_s2[de_indices])[:, 1]
     elif s2_model is None:
         print("  Stage 2 model not available, using DE probability only.")
 
@@ -127,10 +163,7 @@ def main():
     # --- Add context from network features if available ---
     net_cols = [c for c in pred_df.columns if c.startswith("ppi_")]
     if net_cols:
-        results = results.merge(
-            pred_df[["UniProt_ID"] + net_cols],
-            on="UniProt_ID", how="left"
-        )
+        results = results.merge(pred_df[["UniProt_ID"] + net_cols], on="UniProt_ID", how="left")
 
     # --- Save ---
     output_path = Path(CONFIG["output_csv"])

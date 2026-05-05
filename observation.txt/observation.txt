@@ -1,0 +1,5 @@
+                                                                                                                 
+  When you would retrain: Before final submission, if you want to:                                                 
+  - Re-run the permutation test on the non-sequence model specifically
+  - Generate new SHAP plots for the 164-feature model (which would be much more interpretable)                     
+  - Update 10_predict_undetected.py to use the improved model  

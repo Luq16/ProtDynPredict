@@ -13,9 +13,10 @@ Sections:
   5. Confusion matrices
 
 Input:  data/{dataset}/processed/feature_matrix_train.csv  (ucec, coad, brca)
-Output: results/reports/cross_validation_report.md
-        results/figures/cross_dataset_auc.png
-        results/figures/cross_dataset_confusion.png
+Output: configurable via --reports-dir / --figures-dir
+        default: results/cross_dataset/reports/cross_validation_report.md
+                 results/cross_dataset/figures/cross_dataset_auc.png
+                 results/cross_dataset/figures/cross_dataset_confusion.png
 """
 
 import argparse
@@ -203,34 +204,44 @@ def prepare_binary_labels(labels: np.ndarray, stage: int = 1):
 #  Model Training & Evaluation                                        #
 # ------------------------------------------------------------------ #
 
-def _load_stored_params() -> dict | None:
-    """Try to load hyperparameters from the saved stage-1 model."""
-    model_path = Path(CONFIG["model_dir"]) / "stage1_model.joblib"
-    if not model_path.exists():
+def _load_stage_bundle(dataset_name: str, stage: int) -> dict | None:
+    """Load the preferred saved artifact for a dataset/stage pair."""
+    stage_name = f"stage{stage}"
+    candidates = [
+        Path("models") / dataset_name / f"{stage_name}_improved_model.joblib",
+        Path("models") / dataset_name / f"{stage_name}_model.joblib",
+        Path(CONFIG["model_dir"]) / f"{stage_name}_model.joblib",
+    ]
+    model_path = next((p for p in candidates if p.exists()), None)
+    if model_path is None:
         return None
     try:
         bundle = joblib.load(model_path)
-        params = bundle.get("params")
-        if params:
-            print("  Using stored hyperparameters from stage1_model.joblib")
-            return params
+        print(f"  Using stored hyperparameters from {model_path}")
+        return bundle
     except Exception as exc:
         print(f"  WARNING: Could not load stored params: {exc}")
     return None
 
 
-def get_xgb_params() -> dict:
-    """Return XGBoost parameters: stored if available, else defaults."""
-    stored = _load_stored_params()
-    if stored is not None:
+def get_model_spec(dataset_name: str, stage: int) -> tuple[dict, list[str] | None]:
+    """Return preferred params and optional feature restriction for a dataset/stage."""
+    bundle = _load_stage_bundle(dataset_name, stage)
+    if bundle is not None:
+        stored = dict(bundle.get("params", {}))
         # Ensure essential keys are present
         stored.setdefault("objective", "binary:logistic")
         stored.setdefault("eval_metric", "auc")
         stored.setdefault("n_jobs", -1)
         stored.setdefault("verbosity", 0)
-        return stored
+        feature_cols = None
+        if bundle.get("feature_type") == "non-sequence":
+            feature_cols = bundle.get("feature_cols") or bundle.get("nonseq_cols")
+        elif bundle.get("feature_type") == "full":
+            feature_cols = bundle.get("feature_cols")
+        return stored, feature_cols
     print("  Using default XGBoost parameters")
-    return dict(DEFAULT_XGB_PARAMS)
+    return dict(DEFAULT_XGB_PARAMS), None
 
 
 def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray,
@@ -266,8 +277,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, params):
 #  Section 1: Train-on-A, Test-on-B                                   #
 # ------------------------------------------------------------------ #
 
-def pairwise_cross_validation(datasets: dict, shared_cols: list[str],
-                              params: dict) -> list[dict]:
+def pairwise_cross_validation(datasets: dict, shared_cols: list[str]) -> list[dict]:
     """Train on dataset A, test on dataset B for every ordered pair."""
     print("\n" + "=" * 60)
     print("  SECTION 1: Train-on-A, Test-on-B")
@@ -278,10 +288,15 @@ def pairwise_cross_validation(datasets: dict, shared_cols: list[str],
 
     for train_name, test_name in permutations(names, 2):
         for stage in [1, 2]:
+            params, preferred_cols = get_model_spec(train_name, stage)
+            active_shared_cols = shared_cols
+            if preferred_cols is not None:
+                preferred_cols_set = set(preferred_cols)
+                active_shared_cols = [c for c in shared_cols if c in preferred_cols_set]
             stage_label = "DE-vs-Unchanged" if stage == 1 else "Up-vs-Down"
 
-            X_train_full = _extract_aligned(datasets[train_name], shared_cols)
-            X_test_full = _extract_aligned(datasets[test_name], shared_cols)
+            X_train_full = _extract_aligned(datasets[train_name], active_shared_cols)
+            X_test_full = _extract_aligned(datasets[test_name], active_shared_cols)
 
             y_train_all, mask_train = prepare_binary_labels(
                 datasets[train_name]["labels"], stage)
@@ -319,8 +334,7 @@ def pairwise_cross_validation(datasets: dict, shared_cols: list[str],
 #  Section 2: Leave-One-Cancer-Out                                    #
 # ------------------------------------------------------------------ #
 
-def leave_one_cancer_out(datasets: dict, shared_cols: list[str],
-                         params: dict) -> list[dict]:
+def leave_one_cancer_out(datasets: dict, shared_cols: list[str]) -> list[dict]:
     """Train on N-1 datasets, test on the held-out one."""
     print("\n" + "=" * 60)
     print("  SECTION 2: Leave-One-Cancer-Out")
@@ -337,12 +351,23 @@ def leave_one_cancer_out(datasets: dict, shared_cols: list[str],
         train_names = [n for n in names if n != held_out]
 
         for stage in [1, 2]:
+            preferred_sets = []
+            params = None
+            for tn in train_names:
+                params_tn, preferred_cols = get_model_spec(tn, stage)
+                params = params or params_tn
+                if preferred_cols is not None:
+                    preferred_sets.append(set(preferred_cols))
+            active_shared_cols = shared_cols
+            if preferred_sets:
+                preferred_intersection = set.intersection(*preferred_sets)
+                active_shared_cols = [c for c in shared_cols if c in preferred_intersection]
             stage_label = "DE-vs-Unchanged" if stage == 1 else "Up-vs-Down"
 
             # Concatenate training data
             X_parts, y_parts = [], []
             for tn in train_names:
-                X_full = _extract_aligned(datasets[tn], shared_cols)
+                X_full = _extract_aligned(datasets[tn], active_shared_cols)
                 y_all, mask = prepare_binary_labels(datasets[tn]["labels"], stage)
                 X_parts.append(X_full[mask])
                 y_parts.append(y_all[mask])
@@ -351,7 +376,7 @@ def leave_one_cancer_out(datasets: dict, shared_cols: list[str],
             y_tr = np.concatenate(y_parts)
 
             # Test data
-            X_test_full = _extract_aligned(datasets[held_out], shared_cols)
+            X_test_full = _extract_aligned(datasets[held_out], active_shared_cols)
             y_test_all, mask_test = prepare_binary_labels(
                 datasets[held_out]["labels"], stage)
             X_te = X_test_full[mask_test]
@@ -382,8 +407,7 @@ def leave_one_cancer_out(datasets: dict, shared_cols: list[str],
 #  Section 4: Per-Class Breakdown                                     #
 # ------------------------------------------------------------------ #
 
-def per_class_breakdown(datasets: dict, shared_cols: list[str],
-                        params: dict) -> list[dict]:
+def per_class_breakdown(datasets: dict, shared_cols: list[str]) -> list[dict]:
     """Per-class AUC for cross-dataset tests (stage 1 only: DE vs unchanged).
 
     Reports AUC separately for up-regulated, down-regulated, and unchanged
@@ -397,8 +421,13 @@ def per_class_breakdown(datasets: dict, shared_cols: list[str],
     names = sorted(datasets.keys())
 
     for train_name, test_name in permutations(names, 2):
-        X_tr = _extract_aligned(datasets[train_name], shared_cols)
-        X_te = _extract_aligned(datasets[test_name], shared_cols)
+        params, preferred_cols = get_model_spec(train_name, stage=1)
+        active_shared_cols = shared_cols
+        if preferred_cols is not None:
+            active_shared_cols = [c for c in shared_cols if c in set(preferred_cols)]
+
+        X_tr = _extract_aligned(datasets[train_name], active_shared_cols)
+        X_te = _extract_aligned(datasets[test_name], active_shared_cols)
 
         y_tr, _ = prepare_binary_labels(datasets[train_name]["labels"], stage=1)
         y_te, _ = prepare_binary_labels(datasets[test_name]["labels"], stage=1)
@@ -685,8 +714,8 @@ def parse_args():
                         help="Root directory containing dataset folders")
     parser.add_argument("--datasets", nargs="+", default=DATASETS,
                         help="Dataset names to include")
-    parser.add_argument("--figures-dir", default=CONFIG["figures_dir"])
-    parser.add_argument("--reports-dir", default=CONFIG["reports_dir"])
+    parser.add_argument("--figures-dir", default="results/cross_dataset/figures")
+    parser.add_argument("--reports-dir", default="results/cross_dataset/reports")
     return parser.parse_args()
 
 
@@ -696,8 +725,6 @@ def main():
     CONFIG["figures_dir"] = args.figures_dir
     CONFIG["reports_dir"] = args.reports_dir
     CONFIG["model_dir"] = f"models/{args.datasets[0]}" if args.datasets else CONFIG["model_dir"]
-    CONFIG["figures_dir"] = f"results/cross_dataset/figures"
-    CONFIG["reports_dir"] = f"results/cross_dataset/reports"
 
     print("=" * 60)
     print("  Phase 5: CROSS-DATASET VALIDATION")
@@ -725,17 +752,14 @@ def main():
         print("  ERROR: No shared features across datasets.")
         sys.exit(1)
 
-    # ---- Get model params ----
-    params = get_xgb_params()
-
     # ---- Section 1: Pairwise ----
-    pairwise_results = pairwise_cross_validation(datasets, shared_cols, params)
+    pairwise_results = pairwise_cross_validation(datasets, shared_cols)
 
     # ---- Section 2: Leave-One-Cancer-Out ----
-    loco_results = leave_one_cancer_out(datasets, shared_cols, params)
+    loco_results = leave_one_cancer_out(datasets, shared_cols)
 
     # ---- Section 4: Per-class breakdown ----
-    per_class_results = per_class_breakdown(datasets, shared_cols, params)
+    per_class_results = per_class_breakdown(datasets, shared_cols)
 
     # ---- Section 5: Confusion matrices ----
     print("\n" + "=" * 60)

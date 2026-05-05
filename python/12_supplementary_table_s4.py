@@ -57,21 +57,29 @@ def load_dataset(name: str) -> pd.DataFrame | None:
     return pd.read_csv(path)
 
 
-def get_xgb_params(dataset: str) -> dict:
-    model_path = Path("models") / dataset / "stage1_model.joblib"
-    if model_path.exists():
-        try:
-            bundle = joblib.load(model_path)
-            params = bundle.get("params")
-            if params:
-                params.setdefault("objective", "binary:logistic")
-                params.setdefault("eval_metric", "auc")
-                params.setdefault("n_jobs", -1)
-                params.setdefault("verbosity", 0)
-                return params
-        except Exception:
-            pass
-    return dict(DEFAULT_XGB_PARAMS)
+def get_model_spec(dataset: str) -> tuple[dict, list[str] | None]:
+    for model_path in [
+        Path("models") / dataset / "stage1_improved_model.joblib",
+        Path("models") / dataset / "stage1_model.joblib",
+    ]:
+        if model_path.exists():
+            try:
+                bundle = joblib.load(model_path)
+                params = bundle.get("params")
+                if params:
+                    params.setdefault("objective", "binary:logistic")
+                    params.setdefault("eval_metric", "auc")
+                    params.setdefault("n_jobs", -1)
+                    params.setdefault("verbosity", 0)
+                    feature_cols = None
+                    if bundle.get("feature_type") == "non-sequence":
+                        feature_cols = bundle.get("feature_cols") or bundle.get("nonseq_cols")
+                    elif bundle.get("feature_type") == "full":
+                        feature_cols = bundle.get("feature_cols")
+                    return params, feature_cols
+            except Exception:
+                pass
+    return dict(DEFAULT_XGB_PARAMS), None
 
 
 def main():
@@ -95,7 +103,7 @@ def main():
     names = sorted(data.keys())
 
     for train_name in names:
-        params = get_xgb_params(train_name)
+        params, preferred_cols = get_model_spec(train_name)
         train_df = data[train_name]
 
         for test_name in names:
@@ -114,6 +122,8 @@ def main():
             train_feats = set(safe_feature_cols(train_df))
             test_feats = set(safe_feature_cols(test_df))
             shared_cols = sorted(train_feats & test_feats)
+            if preferred_cols is not None:
+                shared_cols = [c for c in shared_cols if c in set(preferred_cols)]
 
             # Train
             X_train = train_df[shared_cols].values.astype(np.float32)

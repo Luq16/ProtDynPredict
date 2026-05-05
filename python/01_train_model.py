@@ -39,6 +39,8 @@ import seaborn as sns
 warnings.filterwarnings("ignore", category=FutureWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+EARLY_STOP_FRAC = 0.15
+
 # --- Configuration ---
 CONFIG = {
     "input_file": "data/processed/feature_matrix_train.csv",
@@ -143,6 +145,17 @@ def get_cv_splitter(groups, y, n_folds, seed):
         return list(cv.split(np.zeros(len(y)), y))
 
 
+def nested_early_stop_split(train_idx, y, fold, frac=EARLY_STOP_FRAC):
+    """Split a training fold into base-train and early-stop holdout sets."""
+    rng = np.random.RandomState(CONFIG["random_state"] + fold)
+    n = len(train_idx)
+    n_es = max(int(n * frac), 30)
+    perm = rng.permutation(n)
+    es_mask = perm[:n_es]
+    base_mask = perm[n_es:]
+    return train_idx[base_mask], train_idx[es_mask]
+
+
 def optimize_xgb(X, y, groups, n_folds, n_trials, seed, stage_name):
     """Optimize XGBoost hyperparameters with Optuna."""
     print(f"\nOptimizing {stage_name} ({n_trials} trials)...")
@@ -169,11 +182,12 @@ def optimize_xgb(X, y, groups, n_folds, n_trials, seed, stage_name):
         }
 
         aucs = []
-        for train_idx, val_idx in splits:
+        for fold, (train_idx, val_idx) in enumerate(splits):
+            base_idx, es_idx = nested_early_stop_split(train_idx, y, fold)
             params_copy = {**params, "early_stopping_rounds": 50}
             clf = xgb.XGBClassifier(**params_copy)
-            clf.fit(X[train_idx], y[train_idx],
-                    eval_set=[(X[val_idx], y[val_idx])],
+            clf.fit(X[base_idx], y[base_idx],
+                    eval_set=[(X[es_idx], y[es_idx])],
                     verbose=False)
             y_proba = clf.predict_proba(X[val_idx])[:, 1]
             try:
@@ -217,9 +231,10 @@ def train_final_model(X, y, params, groups, n_folds, seed, stage_name):
     fold_aucs = []
 
     for fold, (train_idx, val_idx) in enumerate(splits):
-        clf = xgb.XGBClassifier(**params)
-        clf.fit(X[train_idx], y[train_idx],
-                eval_set=[(X[val_idx], y[val_idx])],
+        base_idx, es_idx = nested_early_stop_split(train_idx, y, fold)
+        clf = xgb.XGBClassifier(**{**params, "early_stopping_rounds": 50})
+        clf.fit(X[base_idx], y[base_idx],
+                eval_set=[(X[es_idx], y[es_idx])],
                 verbose=False)
 
         y_pred = clf.predict(X[val_idx])

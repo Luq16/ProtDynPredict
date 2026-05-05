@@ -4,11 +4,11 @@
 Feature ablation analysis for ProtDynPredict.
 
 Removes one feature category at a time and measures AUC drop relative to
-the full-feature baseline (Stage 1: DE vs unchanged, 5-fold stratified CV).
+the full-feature baseline under 5-fold stratified CV.
 
 Input:  data/<dataset>/processed/feature_matrix_train.csv
-Output: results/<dataset>/figures/feature_ablation.png
-        results/<dataset>/reports/feature_ablation_report.md
+Output: results/<dataset>/figures/feature_ablation*.png
+        results/<dataset>/reports/feature_ablation*_report.md
 """
 
 import argparse
@@ -90,11 +90,34 @@ def cv_auc(X, y, n_folds=5, seed=42):
     return float(np.mean(fold_aucs)), float(np.std(fold_aucs)), fold_aucs
 
 
+def get_stage_data(df, all_features, stage):
+    """Return stage-specific matrix, labels, and display metadata."""
+    X_all = df[all_features].values.astype(np.float32)
+    X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if stage == 1:
+        y = np.where(df["label"] == "unchanged", 0, 1)
+        counts = f"DE: {np.sum(y==1)} | Unchanged: {np.sum(y==0)}"
+        stage_slug = ""
+        stage_label = "Stage 1: DE vs Unchanged"
+    else:
+        de_mask = df["label"].isin(["up", "down"]).values
+        X_all = X_all[de_mask]
+        y = np.where(df.loc[de_mask, "label"] == "up", 1, 0)
+        counts = f"Up: {np.sum(y==1)} | Down: {np.sum(y==0)}"
+        stage_slug = "_stage2"
+        stage_label = "Stage 2: Up vs Down"
+
+    return X_all, y, counts, stage_slug, stage_label
+
+
 def main():
     parser = argparse.ArgumentParser(description="Feature ablation analysis")
     parser.add_argument("--dataset", default="ucec")
+    parser.add_argument("--stage", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
     ds = args.dataset
+    stage = args.stage
 
     data_path = Path(f"data/{ds}/processed/feature_matrix_train.csv")
     fig_dir = Path(f"results/{ds}/figures")
@@ -103,18 +126,16 @@ def main():
     rpt_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print(f"  Feature Ablation Analysis [{ds.upper()}]")
+    print(f"  Feature Ablation Analysis [{ds.upper()}] - Stage {stage}")
     print("=" * 60)
 
     # ── Load data ────────────────────────────────────────────────────────
     df = pd.read_csv(data_path)
     all_features = _safe_features(df.columns)
-    X_all = df[all_features].values.astype(np.float32)
-    X_all = np.nan_to_num(X_all, nan=0.0, posinf=0.0, neginf=0.0)
-    y = np.where(df["label"] == "unchanged", 0, 1)
+    X_all, y, counts, stage_slug, stage_label = get_stage_data(df, all_features, stage)
 
     print(f"  Proteins: {len(y)} | Features: {len(all_features)}")
-    print(f"  DE: {np.sum(y==1)} | Unchanged: {np.sum(y==0)}\n")
+    print(f"  {counts}\n")
 
     # ── Baseline (all features) ──────────────────────────────────────────
     print("Training baseline (all features)...")
@@ -154,12 +175,12 @@ def main():
 
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(len(labels))
-    bars = ax.bar(x, aucs, yerr=stds, capsize=4, color=colors,
-                  edgecolor="white", linewidth=0.8)
+    ax.bar(x, aucs, yerr=stds, capsize=4, color=colors,
+           edgecolor="white", linewidth=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
     ax.set_ylabel("Mean AUC (5-fold CV)")
-    ax.set_title(f"Feature Ablation — Stage 1 DE vs Unchanged [{ds.upper()}]")
+    ax.set_title(f"Feature Ablation - {stage_label} [{ds.upper()}]")
     ax.axhline(base_auc, color="gray", linestyle=":", linewidth=1, alpha=0.6)
 
     # annotate deltas
@@ -174,7 +195,7 @@ def main():
     ymin = min(aucs) - max(stds) - 0.04
     ax.set_ylim(max(0.4, ymin), min(1.0, max(aucs) + max(stds) + 0.04))
     plt.tight_layout()
-    fig_path = fig_dir / "feature_ablation.png"
+    fig_path = fig_dir / f"feature_ablation{stage_slug}.png"
     plt.savefig(fig_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"\n  Figure saved: {fig_path}")
@@ -183,10 +204,11 @@ def main():
     lines = [
         "# Feature Ablation Report\n",
         f"**Dataset**: {ds.upper()}",
+        f"**Stage**: {stage_label}",
         f"**Date**: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}\n",
         "## Method\n",
         "Each feature category is removed in turn from the safe feature set.",
-        "A 5-fold stratified CV XGBoost (Stage 1: DE vs unchanged) is trained",
+        f"A 5-fold stratified CV XGBoost ({stage_label}) is trained",
         "and the mean AUC compared to the full-feature baseline.\n",
         "## Results\n",
         "| Condition | # Features | AUC (mean +/- std) | Delta AUC | Paired t-test p |",
@@ -220,16 +242,18 @@ def main():
             lines.append("- No ablation showed a statistically significant AUC "
                          "difference from baseline (paired t-test, p < 0.05)")
 
-    lines.append("\n![Feature Ablation](../figures/feature_ablation.png)\n")
+    fig_rel = f"../figures/feature_ablation{stage_slug}.png"
+    lines.append(f"\n![Feature Ablation]({fig_rel})\n")
     lines.append("*Generated by `04b_feature_ablation.py`*\n")
 
-    rpt_path = rpt_dir / "feature_ablation_report.md"
+    rpt_path = rpt_dir / f"feature_ablation{stage_slug}_report.md"
     with open(rpt_path, "w") as f:
         f.write("\n".join(lines))
     print(f"  Report saved: {rpt_path}")
 
     print("\n" + "=" * 60)
     print("  FEATURE ABLATION COMPLETE")
+    print(f"  {stage_label}")
     print(f"  Baseline AUC: {base_auc:.4f}")
     for name, auc, std, delta, nf, pval in results[1:]:
         pval_str = f", p={pval:.4f}" if pval is not None else ""

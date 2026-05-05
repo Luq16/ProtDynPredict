@@ -81,20 +81,23 @@ def safe_feature_cols(df: pd.DataFrame) -> list[str]:
 
 
 def get_xgb_params(dataset: str) -> dict:
-    model_path = Path("models") / dataset / "stage1_model.joblib"
-    if model_path.exists():
-        try:
-            bundle = joblib.load(model_path)
-            params = bundle.get("params")
-            if params:
-                params.setdefault("objective", "binary:logistic")
-                params.setdefault("eval_metric", "auc")
-                params.setdefault("n_jobs", -1)
-                params.setdefault("verbosity", 0)
-                print(f"  Using stored params from {model_path}")
-                return params
-        except Exception:
-            pass
+    for model_path in [
+        Path("models") / dataset / "stage1_improved_model.joblib",
+        Path("models") / dataset / "stage1_model.joblib",
+    ]:
+        if model_path.exists():
+            try:
+                bundle = joblib.load(model_path)
+                params = bundle.get("params")
+                if params:
+                    params.setdefault("objective", "binary:logistic")
+                    params.setdefault("eval_metric", "auc")
+                    params.setdefault("n_jobs", -1)
+                    params.setdefault("verbosity", 0)
+                    print(f"  Using stored params from {model_path}")
+                    return params
+            except Exception:
+                pass
     print(f"  Using default XGBoost params for {dataset}")
     return dict(DEFAULT_XGB_PARAMS)
 

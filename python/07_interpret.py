@@ -7,7 +7,7 @@ Key question: Do network features dominate?
   If yes → model is essentially doing sophisticated label propagation
   If sequence/GO features contribute → novel biological insight
 
-Input:  models/stage1_model.joblib, models/stage2_model.joblib
+Input:  preferred stage-specific model artifacts from models/<dataset>
         data/processed/feature_matrix_train.csv
 Output: results/figures/shap_*.png
         results/reports/interpretation_report.md
@@ -36,6 +36,46 @@ CONFIG = {
     "reports_dir": "results/reports",
     "max_samples_shap": 500,
 }
+
+
+def load_preferred_artifact(model_dir, stage):
+    """Prefer the improved artifact for a stage when present."""
+    improved = Path(model_dir) / f"{stage}_improved_model.joblib"
+    original = Path(model_dir) / f"{stage}_model.joblib"
+    if improved.exists():
+        return improved, joblib.load(improved)
+    if original.exists():
+        return original, joblib.load(original)
+    return None, None
+
+
+def build_feature_matrix(df, artifact, fallback_cols):
+    """Construct the correct feature matrix for an artifact."""
+    feature_type = artifact.get("feature_type", "full")
+
+    if feature_type == "non-sequence":
+        feature_cols = artifact.get("feature_cols") or artifact.get("nonseq_cols") or fallback_cols
+        X = df[feature_cols].values.astype(np.float32)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        return X, feature_cols
+
+    if feature_type == "pca":
+        seq_cols = artifact["seq_cols"]
+        nonseq_cols = artifact["nonseq_cols"]
+        scaler = artifact["scaler"]
+        pca = artifact["pca"]
+        X_seq = df[seq_cols].values.astype(np.float32)
+        X_seq = np.nan_to_num(X_seq, nan=0.0, posinf=0.0, neginf=0.0)
+        X_nonseq = df[nonseq_cols].values.astype(np.float32)
+        X_nonseq = np.nan_to_num(X_nonseq, nan=0.0, posinf=0.0, neginf=0.0)
+        X_pca = pca.transform(scaler.transform(X_seq))
+        X = np.hstack([X_pca, X_nonseq])
+        return X, [f"PC{i+1}" for i in range(X_pca.shape[1])] + nonseq_cols
+
+    feature_cols = artifact.get("feature_cols", fallback_cols)
+    X = df[feature_cols].values.astype(np.float32)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    return X, feature_cols
 
 
 def categorize_feature(name):
@@ -194,26 +234,35 @@ def analyze_stage(model_path, X, feature_cols, stage_name, output_dir):
     plt.savefig(fig_dir / f"shap_categories_{stage_tag}.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-    # 3. Top N individual features (up to 30)
-    top_n = min(30, len(feature_importance))
-    fig, ax = plt.subplots(figsize=(8, max(6, top_n * 0.3)))
-    top30 = feature_importance.head(top_n)
-    bar_colors = [colors.get(c, "#999999") for c in top30["category"]]
-    ax.barh(range(top_n), top30["mean_abs_shap"].values[::-1], color=bar_colors[::-1])
-    ax.set_yticks(range(top_n))
-    ax.set_yticklabels(top30["feature"].values[::-1], fontsize=8)
-    ax.set_xlabel("Mean |SHAP|")
-    ax.set_title(f"Top 30 Features: {stage_name}")
-
-    # Legend
+    # 3. Top-N individual feature bar charts
     from matplotlib.patches import Patch
-    legend_cats = top30["category"].unique()
-    handles = [Patch(color=colors.get(c, "#999999"), label=c) for c in legend_cats]
-    ax.legend(handles=handles, fontsize=7, loc="lower right")
 
-    plt.tight_layout()
-    plt.savefig(fig_dir / f"shap_top30_{stage_tag}.png", dpi=150, bbox_inches="tight")
-    plt.close()
+    def save_top_feature_plot(top_n):
+        n_features = min(top_n, len(feature_importance))
+        top_features = feature_importance.head(n_features)
+
+        fig, ax = plt.subplots(figsize=(8, max(6, n_features * 0.3)))
+        bar_colors = [colors.get(c, "#999999") for c in top_features["category"]]
+        ax.barh(
+            range(n_features),
+            top_features["mean_abs_shap"].values[::-1],
+            color=bar_colors[::-1],
+        )
+        ax.set_yticks(range(n_features))
+        ax.set_yticklabels(top_features["feature"].values[::-1], fontsize=8)
+        ax.set_xlabel("Mean |SHAP|")
+        ax.set_title(f"Top {n_features} Features: {stage_name}")
+
+        legend_cats = top_features["category"].unique()
+        handles = [Patch(color=colors.get(c, "#999999"), label=c) for c in legend_cats]
+        ax.legend(handles=handles, fontsize=7, loc="lower right")
+
+        plt.tight_layout()
+        plt.savefig(fig_dir / f"shap_top{n_features}_{stage_tag}.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+    save_top_feature_plot(30)
+    save_top_feature_plot(50)
 
     return feature_importance, category_pct
 
@@ -241,31 +290,19 @@ def main():
     model_dir = Path(CONFIG["model_dir"])
 
     # Stage 1 - use the model's feature list to match
-    s1_path = model_dir / "stage1_model.joblib"
+    s1_path, s1_data = load_preferred_artifact(model_dir, "stage1")
     s1_importance = s1_categories = None
-    if s1_path.exists():
-        s1_data = joblib.load(s1_path)
-        if "feature_cols" in s1_data:
-            feature_cols = s1_data["feature_cols"]
-        else:
-            feature_cols = all_feature_cols
-        X = df[feature_cols].values.astype(np.float32)
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    if s1_path is not None:
+        X, feature_cols = build_feature_matrix(df, s1_data, all_feature_cols)
         s1_importance, s1_categories = analyze_stage(
             s1_path, X, feature_cols, "Stage 1 (DE vs Unchanged)", CONFIG["figures_dir"]
         )
 
     # Stage 2 (DE proteins only)
-    s2_path = model_dir / "stage2_model.joblib"
+    s2_path, s2_data = load_preferred_artifact(model_dir, "stage2")
     s2_importance = s2_categories = None
-    if s2_path.exists():
-        s2_data = joblib.load(s2_path)
-        if "feature_cols" in s2_data:
-            feature_cols_s2 = s2_data["feature_cols"]
-        else:
-            feature_cols_s2 = all_feature_cols
-        X_s2 = df[feature_cols_s2].values.astype(np.float32)
-        X_s2 = np.nan_to_num(X_s2, nan=0.0, posinf=0.0, neginf=0.0)
+    if s2_path is not None:
+        X_s2, feature_cols_s2 = build_feature_matrix(df, s2_data, all_feature_cols)
         de_mask = df["label"].isin(["up", "down"]).values
         X_de = X_s2[de_mask]
         if len(X_de) >= 10:
